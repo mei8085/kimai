@@ -1,0 +1,485 @@
+# Kimai 导出流程梳理
+
+本文档梳理了 Kimai 时间追踪系统中从数据生成到导出包下载的完整流程。
+
+## 整体流程概览
+
+```
+请求入口 (Controller)
+    ↓
+格式注册 (ServiceExport + CompilerPass)
+    ↓
+数据查询 (ExportQuery → ExportRepository → TimesheetRepository)
+    ↓
+字段映射 (ColumnConverter → Column → CellFormatter)
+    ↓
+文件打包 (SpreadsheetPackage / PDFRenderer / HtmlRenderer)
+    ↓
+下载响应 (BinaryFileResponse / Response)
+```
+
+---
+
+## 1. 请求入口
+
+### 1.1 Web 控制器
+
+**文件**: [src/Controller/ExportController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Controller/ExportController.php)
+
+导出功能的主控制器，提供两个主要路由：
+
+- **`GET /export/`** (`export`) - 导出页面，展示预览和导出按钮
+  - 方法: `indexAction()`
+  - 构建 `ExportQuery` 查询对象
+  - 通过 `ExportToolbarForm` 处理搜索过滤条件
+  - 调用 `getEntries()` 获取预览数据（最多 500 条）
+  - 收集所有可用的渲染器并渲染导出页面
+
+- **`POST /export/data`** (`export_data`) - 执行导出
+  - 方法: `export()`
+  - 从表单中获取渲染器类型 (`renderer`)
+  - 通过 `ServiceExport::getRendererById()` 获取对应渲染器
+  - 设置导出超时时间
+  - 调用 `getEntries()` 获取完整导出数据
+  - 调用 `$renderer->render()` 生成导出响应
+  - 可选：标记已导出 (`markAsExported`)
+
+### 1.2 API 控制器
+
+**文件**: [src/API/ExportController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/API/ExportController.php)
+
+- **`DELETE /api/export/{id}`** - 删除导出模板
+
+### 1.3 工具栏表单
+
+**文件**: [src/Form/Toolbar/ExportToolbarForm.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Form/Toolbar/ExportToolbarForm.php)
+
+导出过滤表单，包含以下字段：
+- 搜索关键词
+- 日期范围
+- 客户/项目/活动多选
+- 标签
+- 用户/团队（有权限时）
+- 导出状态选择
+- 工时单状态选择
+- 可计费状态
+- `renderer` (隐藏字段) - 导出格式
+- `markAsExported` (隐藏字段) - 是否标记为已导出
+
+---
+
+## 2. 格式注册机制
+
+### 2.1 核心服务
+
+**文件**: [src/Export/ServiceExport.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/ServiceExport.php)
+
+`ServiceExport` 是导出功能的核心服务，负责管理所有渲染器和数据仓库。
+
+### 2.2 编译器通行证（自动注册）
+
+**文件**: [src/DependencyInjection/Compiler/ExportServiceCompilerPass.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/DependencyInjection/Compiler/ExportServiceCompilerPass.php)
+
+通过 Symfony 的 CompilerPass 机制自动注册带有特定标签的服务：
+
+- **RendererInterface** 标签 → `addRenderer()` - 注册通用渲染器
+- **TimesheetExportInterface** 标签 → `addTimesheetExporter()` - 注册工时单导出器
+- **ExportRepositoryInterface** 标签 → `addExportRepository()` - 注册导出数据仓库
+
+接口自动打标签通过 `#[AutoconfigureTag]` 注解实现。
+
+### 2.3 内建渲染器
+
+`ServiceExport::getRenderer()` 方法动态构建渲染器列表，来源包括：
+
+1. **默认渲染器** (4 种)：
+   - CSV: `csvRendererFactory->createDefault()`
+   - XLSX: `xlsxRendererFactory->createDefault()`
+   - PDF: `pdfRendererFactory->create('pdf', 'export/pdf-layout.html.twig', 'pdf')`
+   - HTML/打印: `htmlRendererFactory->create('print', 'export/print.html.twig')`
+
+2. **数据库中的导出模板**：
+   - 从 `ExportTemplateRepository` 加载所有模板
+   - 根据模板类型 (csv/xlsx/pdf) 动态创建对应渲染器
+
+3. **自定义模板目录**：
+   - 扫描配置的目录中的 `*.html.twig` 和 `*.pdf.twig` 文件
+   - 自动创建 HTML/PDF 渲染器
+
+### 2.4 渲染器工厂
+
+| 工厂类 | 文件 | 用途 |
+|--------|------|------|
+| `CsvRendererFactory` | [src/Export/Renderer/CsvRendererFactory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Renderer/CsvRendererFactory.php) | 创建 CSV 渲染器 |
+| `XlsxRendererFactory` | [src/Export/Renderer/XlsxRendererFactory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Renderer/XlsxRendererFactory.php) | 创建 XLSX 渲染器 |
+| `PdfRendererFactory` | [src/Export/Renderer/PdfRendererFactory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Renderer/PdfRendererFactory.php) | 创建 PDF 渲染器 |
+| `HtmlRendererFactory` | [src/Export/Renderer/HtmlRendererFactory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Renderer/HtmlRendererFactory.php) | 创建 HTML 渲染器 |
+
+### 2.5 渲染器接口
+
+**文件**: [src/Export/ExportRendererInterface.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/ExportRendererInterface.php)
+
+```php
+interface ExportRendererInterface
+{
+    public function render(array $exportItems, TimesheetQuery $query): Response;
+    public function getId(): string;
+    public function getTitle(): string;
+}
+```
+
+---
+
+## 3. 数据查询流程
+
+### 3.1 查询对象
+
+**文件**: [src/Repository/Query/ExportQuery.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Repository/Query/ExportQuery.php)
+
+`ExportQuery` 继承自 `TimesheetQuery`，增加了导出特定属性：
+- `renderer` - 导出格式类型
+- `markAsExported` - 是否标记为已导出
+
+默认设置：
+- 排序：升序
+- 状态：已停止
+- 导出状态：未导出
+
+### 3.2 数据仓库接口
+
+**文件**: [src/Export/ExportRepositoryInterface.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/ExportRepositoryInterface.php)
+
+```php
+interface ExportRepositoryInterface
+{
+    public function setExported(array $items): void;
+    public function getExportItemsForQuery(ExportQuery $query): iterable;
+    public function getType(): string;
+}
+```
+
+### 3.3 工时单导出仓库
+
+**文件**: [src/Export/TimesheetExportRepository.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/TimesheetExportRepository.php)
+
+`TimesheetExportRepository` 是默认的导出数据仓库：
+
+- `getExportItemsForQuery()`:
+  - 添加查询提示：客户/项目/活动元字段、用户偏好
+  - 调用 `TimesheetRepository::getTimesheetResult()` 获取结果
+  - 返回 `ExportableItem[]` 数组
+
+- `setExported()`:
+  - 筛选出 `Timesheet` 实例
+  - 调用 `TimesheetRepository::setExported()` 批量标记
+
+### 3.4 ServiceExport 数据查询
+
+**`ServiceExport::getExportItems()` 方法**：
+
+1. 遍历所有已注册的 `ExportRepositoryInterface`
+2. 调用每个仓库的 `getExportItemsForQuery()` 方法
+3. 合并所有结果
+4. 检查结果数量是否超过最大值（通过事件 `ExportItemsQueryEvent` 配置）
+5. 超出限制抛出 `TooManyItemsExportException`
+
+---
+
+## 4. 字段映射逻辑
+
+### 4.1 列转换器
+
+**文件**: [src/Export/ColumnConverter.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/ColumnConverter.php)
+
+`ColumnConverter` 负责将模板中的列名转换为实际的 `Column` 对象。
+
+#### 动态元字段发现
+
+通过事件调度器动态发现元字段列：
+- `TimesheetMetaDisplayEvent` - 工时单元字段
+- `CustomerMetaDisplayEvent` - 客户元字段
+- `ProjectMetaDisplayEvent` - 项目元字段
+- `ActivityMetaDisplayEvent` - 活动元字段
+- `UserPreferenceDisplayEvent` - 用户偏好
+
+#### 列名映射表
+
+| 列名 | 实体属性 | 格式化器 |
+|------|----------|----------|
+| `date` | `begin` (日期部分) | DateFormatter |
+| `begin` | `begin` (时间部分) | TimeFormatter |
+| `end` | `end` (时间部分) | TimeFormatter |
+| `duration` | `duration` | DurationFormatter |
+| `duration_decimal` | `duration` | DurationDecimalFormatter |
+| `duration_seconds` | `duration` | DurationFormatter (含秒) |
+| `break` | `break` | DurationFormatter |
+| `currency` | `project.customer.currency` | DefaultFormatter |
+| `rate` | `rate` | RateFormatter |
+| `internal_rate` | `internalRate` | RateFormatter |
+| `hourly_rate` | `hourlyRate` | RateFormatter |
+| `fixed_rate` | `fixedRate` | RateFormatter |
+| `user.alias` | `user.displayName` | DefaultFormatter |
+| `user.name` | `user.userIdentifier` | DefaultFormatter |
+| `user.email` | `user.email` | DefaultFormatter |
+| `user.account_number` | `user.accountNumber` | DefaultFormatter |
+| `customer.name` | `project.customer.name` | DefaultFormatter |
+| `project.name` | `project.name` | DefaultFormatter |
+| `activity.name` | `activity.name` | DefaultFormatter |
+| `description` | `description` | TextFormatter |
+| `exported` | `exported` | BooleanFormatter |
+| `billable` | `billable` | BooleanFormatter |
+| `tags` | `tagsAsArray()` | ArrayFormatter |
+| `type` | `type` | DefaultFormatter |
+| `category` | `category` | DefaultFormatter |
+| `customer.number` | `project.customer.number` | DefaultFormatter |
+| `project.number` | `project.number` | DefaultFormatter |
+| `activity.number` | `activity.number` | DefaultFormatter |
+| `customer.vat_id` | `project.customer.vatId` | DefaultFormatter |
+| `project.order_number` | `project.orderNumber` | DefaultFormatter |
+| `id` | `id` | DefaultFormatter |
+| `timesheet.meta.*` | 元字段值 | DefaultFormatter |
+| `customer.meta.*` | 客户元字段值 | DefaultFormatter |
+| `project.meta.*` | 项目元字段值 | DefaultFormatter |
+| `activity.meta.*` | 活动元字段值 | DefaultFormatter |
+| `user.meta.*` | 用户偏好值 | DefaultFormatter |
+
+#### 权限控制
+
+- 金额相关列 (`currency`, `rate`, `internal_rate`, `hourly_rate`, `fixed_rate`) 受权限控制
+- 根据 `view_rate_own_timesheet` / `view_rate_other_timesheet` 权限决定是否显示
+
+### 4.2 列定义
+
+**文件**: [src/Export/Package/Column.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Package/Column.php)
+
+`Column` 类表示导出中的一列，包含：
+- `name` - 列名
+- `header` - 表头标题
+- `formatter` - 单元格格式化器
+- `extractor` - 数据提取闭包
+- `columnWidth` - 列宽 (SMALL/MEDIUM/LARGE/DEFAULT)
+
+核心方法：
+- `extract(ExportableItem)` - 提取原始值
+- `getValue(ExportableItem)` - 获取格式化后的值
+
+### 4.3 单元格格式化器
+
+**目录**: [src/Export/Package/CellFormatter/](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Package/CellFormatter/)
+
+| 格式化器 | 用途 |
+|----------|------|
+| `DefaultFormatter` | 默认格式化 |
+| `DateFormatter` | 日期格式化 |
+| `DateStringFormatter` | 日期字符串格式化 (CSV用) |
+| `TimeFormatter` | 时间格式化 |
+| `DurationFormatter` | 时长格式化 (hh:mm) |
+| `DurationDecimalFormatter` | 时长十进制格式化 |
+| `DurationPlainFormatter` | 纯文本时长格式化 (CSV用) |
+| `RateFormatter` | 金额格式化 |
+| `TextFormatter` | 文本格式化 |
+| `BooleanFormatter` | 布尔值格式化 |
+| `ArrayFormatter` | 数组格式化 (标签等) |
+
+### 4.4 可导出项接口
+
+**文件**: [src/Entity/ExportableItem.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Entity/ExportableItem.php)
+
+`ExportableItem` 是所有可导出实体必须实现的接口，定义了导出所需的所有属性访问方法。
+
+---
+
+## 5. 文件打包
+
+### 5.1 电子表格打包 (CSV/XLSX)
+
+#### 抽象基类
+
+**文件**: [src/Export/Base/AbstractSpreadsheetRenderer.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Base/AbstractSpreadsheetRenderer.php)
+
+`writeSpreadsheet()` 方法核心逻辑：
+
+1. 通过 `ColumnConverter::getColumns()` 获取列定义
+2. 设置电子表格包的列
+3. 遍历导出项，逐行提取数据并添加
+4. 添加汇总行（duration, rate, internalRate 使用 SUBTOTAL 公式）
+5. 调用 `save()` 保存文件
+
+#### CSV 渲染器
+
+**文件**: [src/Export/Base/CsvRenderer.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Base/CsvRenderer.php)
+
+- 使用 `OpenSpout\Writer\CSV\Writer`
+- 临时文件: `tempnam(sys_get_temp_dir(), 'kimai-export-csv')`
+- 可配置分隔符 (逗号/分号)
+- 注册特殊格式化器: `DateStringFormatter`, `DurationPlainFormatter`
+
+#### XLSX 渲染器
+
+**文件**: [src/Export/Base/XlsxRenderer.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Base/XlsxRenderer.php)
+
+- 使用 `OpenSpout\Writer\XLSX\Writer`
+- 临时文件: `tempnam(sys_get_temp_dir(), 'kimai-export-xlsx')`
+- 支持自动筛选、列宽设置
+
+#### Spout 电子表格包
+
+**文件**: [src/Export/Package/SpoutSpreadsheet.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Package/SpoutSpreadsheet.php)
+
+`SpoutSpreadsheet` 实现了 `SpreadsheetPackage` 接口，封装了 OpenSpout 库：
+
+- `open()` - 打开文件
+- `setColumns()` - 设置表头（含样式：加粗、灰色背景、底部边框）
+- `addRow()` - 添加数据行
+- `save()` - 保存并关闭
+
+XLSX 特有功能：
+- 自动筛选 (AutoFilter)
+- 列宽设置
+- 冻结行列
+
+### 5.2 PDF 渲染器
+
+**文件**: [src/Export/Base/PDFRenderer.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Base/PDFRenderer.php)
+
+渲染流程：
+
+1. 计算数据汇总 (`calculateSummary`)
+2. 启用 Twig Sandbox 安全策略
+3. 渲染 Twig 模板 (默认: `export/pdf-layout.html.twig`)
+4. 禁用 Sandbox
+5. 通过 `HtmlToPdfConverter` 将 HTML 转换为 PDF
+6. 返回 PDF 响应
+
+模板变量：
+- `entries` - 导出项数组
+- `query` - 查询对象
+- `summaries` - 按客户/项目汇总数据
+- `budgets` - 项目预算统计
+- `decimal` - 是否使用十进制度量
+- `pdfContext` - PDF 上下文
+
+### 5.3 HTML 渲染器
+
+**文件**: [src/Export/Base/HtmlRenderer.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Base/HtmlRenderer.php)
+
+与 PDF 渲染器类似，但直接返回 HTML 响应，用于打印预览。
+
+额外模板变量：
+- `timesheetMetaFields` - 工时单元字段
+- `customerMetaFields` - 客户元字段
+- `projectMetaFields` - 项目元字段
+- `activityMetaFields` - 活动元字段
+- `userPreferences` - 用户偏好
+- `activity_budgets` - 活动预算统计
+
+### 5.4 渲染器特性 (RendererTrait)
+
+**文件**: [src/Export/Base/RendererTrait.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Base/RendererTrait.php)
+
+提供通用计算方法：
+- `calculateSummary()` - 按客户/项目/活动/用户/类型/类别汇总时长和金额
+- `calculateProjectBudget()` - 计算项目预算使用情况
+- `calculateActivityBudget()` - 计算活动预算使用情况
+
+### 5.5 模板定义
+
+#### 模板接口
+
+**文件**: [src/Export/TemplateInterface.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/TemplateInterface.php)
+
+```php
+interface TemplateInterface
+{
+    public function getId(): string;
+    public function getTitle(): string;
+    public function getColumns(TimesheetQuery $query): array;
+    public function getLocale(): ?string;
+    public function getOptions(): array;
+}
+```
+
+#### 默认模板
+
+**文件**: [src/Export/DefaultTemplate.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/DefaultTemplate.php)
+
+包含完整的默认列列表，并通过事件动态添加元字段列。
+
+#### 通用模板
+
+**文件**: [src/Export/Template.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Template.php)
+
+用于从数据库导出模板创建的通用模板实现，支持自定义列、语言和选项。
+
+### 5.6 文件名生成
+
+**文件**: [src/Export/ExportFilename.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/ExportFilename.php)
+
+文件名格式：`{日期}-{客户名}-{项目名}-{用户名}`
+
+- 单个客户/项目/用户时才会添加对应名称
+- 都没有时使用 `kimai-export`
+- 通过 `FileHelper::convertToAsciiFilename()` 转换为安全文件名
+
+---
+
+## 6. 下载响应
+
+### 6.1 二进制文件响应
+
+电子表格导出使用 `BinaryFileResponse`：
+
+```php
+$response = new BinaryFileResponse($file);
+$disposition = $response->headers->makeDisposition(
+    ResponseHeaderBag::DISPOSITION_ATTACHMENT, 
+    $filename
+);
+$response->headers->set('Content-Type', $contentType);
+$response->headers->set('Content-Disposition', $disposition);
+$response->deleteFileAfterSend(true);  // 发送后删除临时文件
+```
+
+### 6.2 Content-Type 对应表
+
+| 格式 | Content-Type | 文件扩展名 |
+|------|--------------|------------|
+| CSV | `text/csv` | `.csv` |
+| XLSX | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` | `.xlsx` |
+| PDF | `application/pdf` | `.pdf` |
+| HTML | `text/html` | - |
+
+### 6.3 内联显示 (DispositionInlineInterface)
+
+**文件**: [src/Export/Base/DispositionInlineInterface.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Base/DispositionInlineInterface.php)
+
+支持内联显示的渲染器（如 PDF）在不标记为已导出时，使用 `DISPOSITION_INLINE` 在浏览器中直接打开。
+
+### 6.4 标记已导出
+
+当 `markAsExported` 为 true 时：
+- 调用 `ServiceExport::setExported()`
+- 遍历所有 `ExportRepositoryInterface`
+- 各仓库负责将对应实体标记为已导出
+
+---
+
+## 关键文件索引
+
+| 类别 | 文件路径 |
+|------|----------|
+| 控制器 | [src/Controller/ExportController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Controller/ExportController.php) |
+| 核心服务 | [src/Export/ServiceExport.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/ServiceExport.php) |
+| 编译器 | [src/DependencyInjection/Compiler/ExportServiceCompilerPass.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/DependencyInjection/Compiler/ExportServiceCompilerPass.php) |
+| 查询对象 | [src/Repository/Query/ExportQuery.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Repository/Query/ExportQuery.php) |
+| 数据仓库 | [src/Export/TimesheetExportRepository.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/TimesheetExportRepository.php) |
+| 列转换器 | [src/Export/ColumnConverter.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/ColumnConverter.php) |
+| 列定义 | [src/Export/Package/Column.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Package/Column.php) |
+| CSV 渲染器 | [src/Export/Base/CsvRenderer.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Base/CsvRenderer.php) |
+| XLSX 渲染器 | [src/Export/Base/XlsxRenderer.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Base/XlsxRenderer.php) |
+| PDF 渲染器 | [src/Export/Base/PDFRenderer.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Base/PDFRenderer.php) |
+| HTML 渲染器 | [src/Export/Base/HtmlRenderer.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Base/HtmlRenderer.php) |
+| 电子表格包 | [src/Export/Package/SpoutSpreadsheet.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Package/SpoutSpreadsheet.php) |
+| 文件名 | [src/Export/ExportFilename.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/ExportFilename.php) |
+| 实体接口 | [src/Entity/ExportableItem.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Entity/ExportableItem.php) |
+| 表单 | [src/Form/Toolbar/ExportToolbarForm.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Form/Toolbar/ExportToolbarForm.php) |
