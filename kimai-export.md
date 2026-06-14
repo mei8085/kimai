@@ -26,7 +26,9 @@
 
 **文件**: [src/Controller/ExportController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Controller/ExportController.php)
 
-导出功能的主控制器，提供两个主要路由：
+导出功能的主控制器，类级别标注 `#[IsGranted('create_export')]`，在请求进入方法前即由 Symfony Security 层完成权限校验——无权限用户直接返回 403，不会进入任何业务逻辑。
+
+提供两个主要路由：
 
 - **`GET /export/`** (`export`) - 导出页面，展示预览和导出按钮
   - 方法: `indexAction()`
@@ -34,15 +36,19 @@
   - 通过 `ExportToolbarForm` 处理搜索过滤条件
   - 调用 `getEntries()` 获取预览数据（最多 500 条）
   - 收集所有可用的渲染器并渲染导出页面
+  - **错误分支 - 数据量超限**：`getEntries()` 可能抛出 `TooManyItemsExportException`，被 try-catch 捕获后设置 `$tooManyResults = true`、`$showPreview = false`、清空 `$entries`，并通过 `logException()` 以 `critical` 级别记录日志，最终仍正常渲染页面（模板通过 `too_many` 变量提示用户缩小范围），不会中断或报错。
+  - **权限分支 - 金额可见性**：页面层独立判断 `show_rates` 变量（依据 `view_rate_other_timesheet` / `view_rate_own_timesheet`），供 Twig 模板决定是否显示金额列预览，该判断与实际导出时的拦截是**两层独立逻辑**。
 
 - **`POST /export/data`** (`export_data`) - 执行导出
-  - 方法: `export()`
-  - 从表单中获取渲染器类型 (`renderer`)
-  - 通过 `ServiceExport::getRendererById()` 获取对应渲染器
-  - 设置导出超时时间
-  - 调用 `getEntries()` 获取完整导出数据
-  - 调用 `$renderer->render()` 生成导出响应
-  - 可选：标记已导出 (`markAsExported`)
+  - 方法: `export()` [L126-L162](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Controller/ExportController.php#L126-L162)
+  - **分支 1 - 缺少渲染器参数**：`$query->getRenderer()` 返回 null 时，调用 `createNotFoundException('Missing export renderer')` 抛出 404，响应为标准 HTML 错误页。
+  - **分支 2 - 未知渲染器 ID**：`ServiceExport::getRendererById()` 返回 null 时，抛出 404 `'Unknown export renderer'`，同上。
+  - **执行超时保护**：导出前通过 `ini_set('max_execution_time', $systemConfiguration->getExportTimeout())` 临时放宽 PHP 执行时限（配置项 `export.timeout`），导出完成后在 `finally` 语义位置（代码实际为导出结束后立即）恢复原值 `$oldMaxExecTime`。**注意**：此处并未使用 try-finally，如果 `render()` 或后续代码抛出异常/致命错误，`max_execution_time` 将无法恢复，依赖 PHP 请求结束后的进程回收。
+  - **内联显示开关**：若渲染器实现 `DispositionInlineInterface`（当前仅 PDF）且未勾选 `markAsExported`，则调用 `setDispositionInline(true)`，PDF 将在浏览器中直接打开而非下载。
+  - **数据查询**：调用 `getEntries()`，此处若触发 `TooManyItemsExportException`，**没有 try-catch**，异常会冒泡到 Symfony ErrorHandler，用户看到 500 错误页而非友好提示（设计上认为预览已拦截过超限，正式导出不应再触发）。
+  - **生成响应**：`$renderer->render($entries, $query)` 返回 Response。
+  - **标记已导出**：`markAsExported` 为 true 时，遍历所有 `ExportRepositoryInterface::setExported()` 将条目状态写回数据库。此操作在响应生成**之后**执行，若数据库写入失败，用户仍会收到下载成功的响应但数据未被标记（存在一致性风险，设计权衡：优先保证用户拿到文件）。
+  - **无数据场景**：当 `$entries` 为空数组时，各渲染器行为不同：电子表格渲染器仅输出表头+无汇总行（`$currentRow === 1` 跳过汇总），PDF/HTML 模板自行渲染空状态提示，均不会抛异常。
 
 ### 1.2 API 控制器
 
