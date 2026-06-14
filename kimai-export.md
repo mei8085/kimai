@@ -181,13 +181,62 @@ interface ExportRepositoryInterface
 
 ### 3.4 ServiceExport 数据查询
 
-**`ServiceExport::getExportItems()` 方法**：
+**`ServiceExport::getExportItems()` 方法** [ServiceExport.php L225-L256](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/ServiceExport.php#L225-L256)：
 
-1. 遍历所有已注册的 `ExportRepositoryInterface`
-2. 调用每个仓库的 `getExportItemsForQuery()` 方法
-3. 合并所有结果
-4. 检查结果数量是否超过最大值（通过事件 `ExportItemsQueryEvent` 配置）
-5. 超出限制抛出 `TooManyItemsExportException`
+1. 派发 `ExportItemsQueryEvent` 事件，通过监听器可动态设置 `$query->setMaxResults()`（默认无上限）
+2. 遍历所有已注册的 `ExportRepositoryInterface`
+3. 调用每个仓库的 `getExportItemsForQuery()` 方法
+4. 合并所有结果
+5. 检查结果数量是否超过最大值
+6. 超出限制抛出 `TooManyItemsExportException`
+
+### 3.5 深入分析：超时、空数据、权限不足的抛错链路及响应传递
+
+整个导出流程存在 **三层权限/数据检查**，且每一层的错误表现完全不同：
+
+#### 第一层：路由级权限（Symfony Security）
+
+- **发生位置**：[ExportController.php L34](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Controller/ExportController.php#L34) 的类级注解 `#[IsGranted('create_export')]`
+- **触发时机**：请求进入 Controller 方法之前，由 Symfony Security 防火墙拦截
+- **错误表现**：返回 **403 Forbidden** HTML 页面（Symfony 默认异常页面），不会执行任何业务逻辑
+- **传递链路**：Security → ExceptionListener → 403 Response → 直接发送到浏览器，**完全不经过下载响应**
+
+#### 第二层：SQL 数据可见性过滤（不抛错，静默返回空）
+
+- **发生位置**：[TimesheetRepository.php L525-L676](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Repository/TimesheetRepository.php#L525-L676) 的 `getQueryBuilderForQuery()` 方法
+- **具体检查点**：
+  - **[L566-L578](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Repository/TimesheetRepository.php#L566-L578)**：当 `$currentUser` 不是 admin（`!$currentUser->canSeeAllData()`），自动把自己加入用户过滤列表；如果是 teamlead，自动把所在团队加入查询条件
+  - **[L590-L592](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Repository/TimesheetRepository.php#L590-L592)**：按用户 ID 列表生成 `WHERE t.user IN (...)` SQL 条件
+  - **[L649](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Repository/TimesheetRepository.php#L649)**：调用 `addPermissionCriteria($qb, $query->getCurrentUser(), $query->getTeams())`，在 [L404-L446](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Repository/TimesheetRepository.php#L404-L446) 中根据团队成员关系限制项目/客户可见性：非团队成员只能看到 `SIZE(teams) = 0` 的无团队分配项目/客户
+- **触发时机**：Doctrine 执行 SQL 查询时
+- **错误表现**：**不抛错**！而是通过 WHERE 条件直接过滤掉无权访问的记录，结果可能为空数组
+- **传递链路**：空 `$entries` 数组 → 各渲染器自行渲染空状态 → 下载响应照常返回（只是内容为空）
+- **设计原因**：这是"行级安全"的标准做法——用户永远不知道"有数据但被隐藏了"，只看到"没有数据"，避免信息泄露
+
+#### 第三层：执行超时保护
+
+- **发生位置**：[ExportController.php L144-L159](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Controller/ExportController.php#L144-L159)
+- **具体机制**：`ini_set('max_execution_time', $systemConfiguration->getExportTimeout())` 临时放宽 PHP 执行时间（配置项 `export.timeout`）
+- **触发时机**：PHP 运行时累计 CPU 时间超过阈值时，由 Zend 引擎强制终止
+- **错误表现**：PHP 致命错误 **`Maximum execution time of X seconds exceeded`**，脚本直接终止
+- **传递链路**：PHP Fatal Error → Symfony ErrorHandler 捕获 → 500 HTML 错误页（**不会触发 `deleteFileAfterSend`，已生成的临时文件可能残留**）
+- **关键缺陷**：超时恢复代码 `ini_set('max_execution_time', $oldMaxExecTime)` 位于导出完成之后，没有用 try-finally 包裹。如果超时或异常发生在中间，`max_execution_time` 的修改会泄漏到后续请求（PHP-FPM 模式下）
+
+#### 第四层：数据量超限
+
+- **发生位置**：[ServiceExport.php L233-L237](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/ServiceExport.php#L233-L237)
+- **错误表现**：抛出 `TooManyItemsExportException`
+- **传递链路差异**：
+  - **预览页 `indexAction()`**：[ExportController.php L75-L80](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Controller/ExportController.php#L75-L80) 被 try-catch 捕获 → 设置 `$tooManyResults = true` → 渲染友好提示页面
+  - **正式导出 `export()`**：**没有 try-catch** → 冒泡到 Symfony → 500 错误页
+
+#### 空数据场景（非错误）
+
+当查询条件合法但结果集为空时（例如日期范围无数据）：
+- **传递链路**：空数组 `$entries = []` → `$renderer->render([], $query)`
+- **电子表格渲染器**：[AbstractSpreadsheetRenderer.php L66](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Base/AbstractSpreadsheetRenderer.php#L66) 中 `$currentRow > 1` 条件不满足 → 只输出表头，跳过汇总行 → 返回正常的 CSV/XLSX 文件（仅含表头）
+- **PDF/HTML 渲染器**：Twig 模板接收空 `entries` 数组 → 模板自行渲染空状态提示文字 → 返回正常的 PDF/HTML
+- **结论**：空数据不被视为错误，响应状态码始终为 **200 OK**
 
 ---
 
@@ -461,12 +510,47 @@ $response->deleteFileAfterSend(true);  // 发送后删除临时文件
 
 支持内联显示的渲染器（如 PDF）在不标记为已导出时，使用 `DISPOSITION_INLINE` 在浏览器中直接打开。
 
+**条件判断逻辑**（[ExportController.php L147-L150](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Controller/ExportController.php#L147-L150)）：
+- 渲染器必须实现 `DispositionInlineInterface` 接口（当前只有 `PDFRenderer`）
+- 并且 `!$query->isMarkAsExported()`（用户未勾选"标记为已导出"）
+- 同时满足时 PDF 在浏览器标签页内打开，否则触发下载对话框
+
+**设计原因**："标记为已导出"通常意味着正式归档流程，用户需要下载本地保存；而未标记时更可能是预览查看，浏览器直接打开更方便。
+
 ### 6.4 标记已导出
 
 当 `markAsExported` 为 true 时：
 - 调用 `ServiceExport::setExported()`
 - 遍历所有 `ExportRepositoryInterface`
 - 各仓库负责将对应实体标记为已导出
+
+**关键设计：执行顺序与一致性风险**（[ExportController.php L152-L157](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Controller/ExportController.php#L152-L157)）：
+
+```php
+$entries = $this->getEntries($query);
+$response = $renderer->render($entries, $query);  // 先生成响应
+if ($query->isMarkAsExported()) {
+    $this->export->setExported($entries);           // 后更新数据库
+}
+```
+
+- **先渲染响应，再写数据库**：若数据库写入失败（事务超时、连接断开），用户仍能正常下载文件。这是**可用性 > 一致性**的权衡——宁可状态未更新、用户下次再导出一次，也不能让用户看不到数据、白等半天。
+- **无事务包裹**：`setExported()` 不在事务内执行，多个仓库中若部分成功部分失败，不会回滚。
+- **无异常捕获**：数据库写入异常会冒泡为 500，但此时响应头已发送，用户端可能已收到部分文件内容（浏览器显示下载失败）。
+
+### 6.5 不同渲染器的响应方式差异
+
+| 渲染器 | 响应类型 | 临时文件 | 数据载体 |
+|--------|----------|----------|----------|
+| CSV | `BinaryFileResponse` | `sys_get_temp_dir()` 中的临时文件 | 文件系统 |
+| XLSX | `BinaryFileResponse` | 同上 | 文件系统 |
+| PDF | `Response` (内存字符串) | 无，PDF 二进制在内存中 | PHP 内存 |
+| HTML | `Response` (内存字符串) | 无，HTML 字符串 | PHP 内存 |
+
+**电子表格使用临时文件而 PDF/HTML 使用内存**的原因：
+- OpenSpout 库使用流式写入，必须以文件为目标；而 mPDF 库输出就是二进制字符串。
+- 大型导出中 XLSX/CSV 可能达数十 MB，流式写入避免一次性占用大量 PHP 内存（受 `memory_limit` 限制）。
+- PDF 内容通常较小且生成过程本身就需要完整 DOM 在内存中，直接返回字符串更简单。
 
 ---
 
