@@ -303,6 +303,89 @@ interface ExportRepositoryInterface
 - 金额相关列 (`currency`, `rate`, `internal_rate`, `hourly_rate`, `fixed_rate`) 受权限控制
 - 根据 `view_rate_own_timesheet` / `view_rate_other_timesheet` 权限决定是否显示
 
+#### 深入分析：金额列权限拦截到底落在导出列表层还是字段映射层
+
+金额列的权限控制采用了**双层防护设计**——Controller 层（导出列表/UI 层）和 ColumnConverter 层（字段映射层）都做了检查，但两层的职责和安全性完全不同。
+
+**第一层：Controller 层（UI 层，仅装饰，不是安全边界）**
+
+[ExportController.php L97-L106](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Controller/ExportController.php#L97-L106) 在预览页 `indexAction()` 中：
+```php
+$showRates = $this->isGranted('view_rate_own_timesheet') 
+    || $this->isGranted('view_rate_other_timesheet');
+```
+这个 `$showRates` 变量只传给 Twig 模板，用于控制预览页面上是否显示"金额"相关列的勾选框。它的作用是**优化 UX**：如果用户根本没有查看金额的权限，就不要在 UI 上展示这些选项，避免困惑。
+
+⚠️ 但这一层完全不是安全边界——如果用户通过直接构造 URL 参数（如 `?columns[]=rate`）或直接调用 `/export/{renderer}` 正式导出，Controller 层的 UI 判断根本不会生效。真正的安全边界在下一层。
+
+**第二层：ColumnConverter 层（字段映射层，真正的安全边界）**
+
+[ColumnConverter.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/ColumnConverter.php) 中的拦截分两步：
+
+**Step 1 - `isRenderRate()` 上下文条件判断 [L57-L69]**：
+```php
+private function isRenderRate(TimesheetQuery $query): bool
+{
+    if ($this->security->getUser() === null) {
+        return true;  // CLI：无 HTTP 会话用户，默认放行
+    }
+    if (null !== $query->getUser()) {
+        return $this->security->isGranted('view_rate_own_timesheet');
+    }
+    return $this->security->isGranted('view_rate_other_timesheet');
+}
+```
+这里的关键设计是**根据查询上下文选择检查哪个权限，而不是两者取 OR**：
+
+- `$this->security->getUser() === null`：CLI 模式（`bin/console kimai:export:create`），Security 组件无 HTTP 会话，`getUser()` 返回 null → 直接放行。这是更可靠的 CLI 检测方式，比 `$this->kernel->isConsole()` 更精确——因为 `isConsole()` 在 phpunit 或 worker 进程中也可能返回 true。
+- `$query->getUser() !== null`：用户正在查看**特定用户**的工时（如自己的），只需 `view_rate_own_timesheet`——因为结果集只包含自己（或自己选定的某个用户）的数据。
+- `$query->getUser() === null`：用户在查看**所有用户**的工时，需要 `view_rate_other_timesheet`——因为结果集包含他人的数据。
+
+这比简单的 `own || other` OR 判断更精确：如果用户有 `view_rate_own_timesheet` 但没有 `view_rate_other_timesheet`，在查看全员数据时仍然无法看到金额列——因为结果集中大部分是别人的数据，不应该仅凭"能看到自己的"就放行所有金额。
+
+**Step 2 - 按列逐个条件过滤 [L193-L202]**：
+在 `getColumns()` 中遍历模板列定义时，5 个金额列使用 `elseif ($column === 'xxx' && $showRates)` 模式：
+```php
+$showRates = $this->isRenderRate($query);
+// ...
+} elseif ($column === 'currency' && $showRates) {
+    $columns[$column] = ...;
+} elseif ($column === 'rate' && $showRates) {
+    $columns[$column] = ...;
+} elseif ($column === 'internal_rate' && $showRates) {
+    $columns[$column] = ...;
+} elseif ($column === 'hourly_rate' && $showRates) {
+    $columns[$column] = ...;
+} elseif ($column === 'fixed_rate' && $showRates) {
+    $columns[$column] = ...;
+}
+```
+只要 `isRenderRate()` 返回 false，5 个金额列的 elseif 条件整体不满足 → 列不会被加入 `$columns` 数组 → 后续的电子表格写入、PDF 渲染都看不到这些列 → 数据在字段映射的源头被截断。注意：不满足条件的列也不会走到最后的 `else` 分支，所以**不会触发未知列名 warning 日志**。
+
+**Step 3 - 日志降噪 [L252]**：
+```php
+} else {
+    if ($this->logger !== null && ($showRates || !\in_array($column, $rateColumns, true))) {
+        $this->logger->warning(...);
+    }
+}
+```
+逻辑是：当 `showRates=true` 时所有未知列都记 warning；当 `showRates=false` 时只对**非金额列**的未知列记 warning——因为金额列被 `&& $showRates` 正常跳过不算异常，而其他未知列名则可能是模板配置错误需要告警。
+
+**两层设计对比**：
+
+| 维度 | Controller 层 show_rates | ColumnConverter 层 isRenderRate |
+|------|-------------------------|--------------------------------|
+| 作用范围 | 仅预览页 UI 表单勾选框 | 所有导出路径（预览、正式导出、API、CLI） |
+| 是否安全边界 | ❌ 不是，URL 参数可绕过 | ✅ 是，列定义被删除后任何路径都无法输出 |
+| 检查粒度 | 全局 boolean | 全局 boolean + 按列逐个过滤 + 日志降噪 |
+| 绕过可能性 | 高（手工构造请求） | 极低（数据层被截断） |
+| 设计目的 | 用户体验优化 | 真正的权限安全控制 |
+
+**为什么两层都要做？**
+- UX 层：用户看不到自己不能操作的选项，减少困惑
+- 安全层：遵循"安全永远在服务端、永远不信任客户端输入"的原则，即使 UI 被绕过也不泄露敏感金额数据
+
 ### 4.2 列定义
 
 **文件**: [src/Export/Package/Column.php](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Package/Column.php)
