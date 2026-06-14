@@ -134,6 +134,67 @@ interface ExportRendererInterface
 }
 ```
 
+### 2.6 深入分析：自动装配比直接工厂调用划算在哪
+
+Kimai 的导出渲染器采用了"**容器自动装配工厂 → 工厂在运行时手动 new 具体渲染器**"的两级模式，而不是让 DI 容器直接注入渲染器实例。这比直接工厂调用划算在以下几条：
+
+#### 理由 1：渲染器依赖有状态对象，不能是单例
+
+[CsvRenderer.php L86-L88](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Base/CsvRenderer.php#L86-L88) 在 `renderFile()` 内调用 `$this->columnConverter->registerFormatter()` 覆盖日期和时长格式化器：
+```php
+$this->columnConverter->registerFormatter('date', new DateStringFormatter());
+$this->columnConverter->registerFormatter('duration', new DurationPlainFormatter(false));
+$this->columnConverter->registerFormatter('duration_seconds', new DurationPlainFormatter(true));
+```
+ColumnConverter 是工厂持有的共享服务。如果渲染器也是容器单例，第一次 CSV 导出后格式化器注册表被污染，后续 XLSX 导出会用到 CSV 的纯文本格式化器，导致 XLSX 日期变成字符串。工厂每次 `new` 全新渲染器实例，天然隔离状态。
+
+#### 理由 2：一个类需要生成多个命名实例
+
+同一份 `PDFRenderer` 类要根据数据库中用户自定义模板生成多个独立实例（各有不同 `id`、`title`、`template`）。DI 容器按类名注册单服务，无法表达"一个类 → N 个命名实例"。工厂的 `create($id, $template)` 签名自然处理一对多。
+
+#### 理由 3：渲染器类被双重排除在自动装配之外
+
+[config/services.yaml L26-L27](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/config/services.yaml#L26-L27)：
+```yaml
+exclude:
+    - '../src/Export/Package/'
+    - '../src/Export/Base/'
+```
+配合各渲染器类上的 `#[Exclude]` 注解（如 [CsvRenderer.php L27](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Base/CsvRenderer.php#L27)）双重保险，强制所有访问经过 ServiceExport，保证渲染器列表的一致性。
+
+#### 理由 4：工厂本身享受自动装配，省掉手动拼依赖
+
+[CsvRendererFactory.php L21-L26](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Renderer/CsvRendererFactory.php#L21-L26)：
+```php
+public function __construct(
+    private readonly ColumnConverter $converter,
+    private readonly EventDispatcherInterface $eventDispatcher,
+    private readonly TranslatorInterface $translator,
+) {}
+```
+ColumnConverter / EventDispatcher / Translator 由容器注入，工厂只需在 `create()` 时传给 `new CsvRenderer(...)`。如果直接 `new Factory()` 手动拼，每个依赖都要自己解析。
+
+#### 理由 5：ServiceExport 作为组合根推迟装配到运行时
+
+[ServiceExport.php L43-L53](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/ServiceExport.php#L43-L53) 只注入 4 个工厂。具体用哪几种渲染器、渲染器的参数（ID/标题/模板路径），要在 `getRenderer()` 运行时结合数据库查询和磁盘扫描才能确定——这是典型的组合根模式。
+
+#### 依赖注入层次
+
+```
+Symfony DI Container
+├── ServiceExport (组合根，自动装配)
+│   ├── CsvRendererFactory ← 自动装配 ColumnConverter/EventDispatcher/Translator
+│   ├── XlsxRendererFactory ← 同上
+│   ├── PdfRendererFactory ← 自动装配 ColumnConverter/Twig/HtmlToPdfConverter/...
+│   └── HtmlRendererFactory ← 同上
+│
+└── 运行时动态装配（getRenderer() 内）
+    ├── 默认 4 个：工厂 -> createDefault() / create('pdf', ...)
+    ├── 数据库模板：遍历 ExportTemplate → 对应工厂 create(template)
+    └── 磁盘扫描：遍历 *.html.twig → Factory create(...)
+        └── 每个 new 出来的渲染器都是独立实例，状态隔离
+```
+
 ---
 
 ## 3. 数据查询流程
@@ -496,6 +557,49 @@ XLSX 特有功能：
 - `budgets` - 项目预算统计
 - `decimal` - 是否使用十进制度量
 - `pdfContext` - PDF 上下文
+
+#### 深入分析：PDF 渲染前后开关 Twig 沙箱的取舍
+
+[PDFRenderer.php L106-L122](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Base/PDFRenderer.php#L106-L122) 中，Twig 沙箱精确包裹 `twig->render()` 调用：渲染前 `$sandbox->enableSandbox()`、渲染后 `$sandbox->disableSandbox()`。HTML 渲染器 [HtmlRenderer.php L103-L124](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Base/HtmlRenderer.php#L103-L124) 采用完全相同的模式。
+
+**为什么不全局启用沙箱？**
+
+Twig Sandbox 通过 `SandboxExtension` + `SecurityPolicyInterface` 实现"模板中只能调用被显式允许的方法/属性"。全局启用会带来三个问题：
+
+1. **Kimai 其他 Twig 场景依赖大量实体方法调用**——后台页面、报表、仪表盘、邮件模板等都用链式访问（如 `project.getCustomer().getName()`），全局开启需维护上百个方法/属性白名单，维护成本极高且极易遗漏。
+2. **性能开销**——沙箱模式下每次属性访问、方法调用都经过安全策略检查，复杂页面有可测量的性能损失。
+3. **只有自定义导出模板有风险**——沙箱的防护目标是"用户创建的不受信任 Twig 模板"（[ServiceExport.php L107-L134](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/ServiceExport.php#L107-L134) 会扫描磁盘目录加载 `*.html.twig` / `*.pdf.twig`），而 Kimai 自带的核心模板是可信的。
+
+**为什么用完必须关？**
+
+[PDFRenderer.php L122](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Base/PDFRenderer.php#L122) 在 `render()` 返回后显式调用 `$sandbox->disableSandbox()`，避免状态泄漏：
+
+- Twig Environment 是共享服务（单例）。如果一个请求内先渲染导出模板（开启沙箱），再渲染异常页面或后续子请求，沙箱仍处于启用状态就会拦截正常模板的方法调用，抛出 `Twig\Sandbox\SecurityError`。
+- **潜在隐患**：代码没有用 try-finally 包裹 `render()` 调用——如果模板渲染抛出 `Twig\Error\RuntimeError` 等异常，沙箱不会被关闭，状态会泄漏到后续代码。
+
+**沙箱的初始化逻辑**
+
+[PDFRenderer.php L106-L108](file:///d:/fz/0601-1/solo-dogfeeding/code/85-kimai/src/Export/Base/PDFRenderer.php#L106-L108)：
+```php
+if (!$this->twig->hasExtension(SandboxExtension::class)) {
+    $this->twig->addExtension(new SandboxExtension(new StrictPolicy()));
+}
+```
+SandboxExtension 只在第一次渲染时注册（懒加载），后续渲染复用已有实例——因为 `addExtension()` 不能重复注册。`StrictPolicy` 是 Kimai 自定义的安全策略，定义了导出模板允许调用的白名单。
+
+**与其他渲染器的对比**
+
+| 渲染器 | 是否启用沙箱 | 原因 |
+|--------|-------------|------|
+| CSV | 否 | 不使用 Twig，纯数据 → OpenSpout 写入 |
+| XLSX | 否 | 不使用 Twig，纯数据 → OpenSpout 写入 |
+| PDF | 是（仅渲染时） | 使用 Twig 模板，且模板可由用户上传 |
+| HTML | 是（仅渲染时） | 同 PDF，使用 Twig 模板 |
+
+**取舍总结**：
+- ✅ 最小权限原则：仅在需要渲染不受信任模板时才启用沙箱
+- ✅ 精确包裹：沙箱作用域最小化到单次 `render()` 调用
+- ⚠️ 潜在缺陷：未用 try-finally，模板渲染异常时沙箱状态可能泄漏
 
 ### 5.3 HTML 渲染器
 
