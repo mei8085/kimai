@@ -2,54 +2,24 @@
 
 ## 总览
 
-Kimai 的数据导出系统采用**分层架构**设计，从 HTTP 请求到最终文件下载，经过以下五个核心层级的协作：
+Kimai 存在**两套独立但概念相似**的导出系统，分别服务于不同场景：
 
-```
-┌───────────────────────────────────────────────────────────┐
-│  1. 控制器层 (Controller Layer)                           │
-│     ExportController / InvoiceController                  │
-│     - 接收 HTTP 请求，解析表单参数                        │
-│     - 权限校验 (create_export, view_invoice)              │
-└─────────────────────────────┬─────────────────────────────┘
-                              │
-┌─────────────────────────────▼─────────────────────────────┐
-│  2. 领域查询层 (Domain Query Layer)                       │
-│     ExportQuery / InvoiceQuery / TimesheetQuery           │
-│     - 封装查询条件（时间范围、客户、项目、状态等）          │
-└─────────────────────────────┬─────────────────────────────┘
-                              │
-┌─────────────────────────────▼─────────────────────────────┐
-│  3. 导出服务层 (Export Service Layer)                     │
-│     ServiceExport + ExportRepositoryInterface             │
-│     - 协调数据获取，聚合多源数据                          │
-│     - 管理渲染器生命周期                                  │
-└─────────────────────────────┬─────────────────────────────┘
-                              │
-┌─────────────────────────────▼─────────────────────────────┐
-│  4. 格式适配层 (Format Adapter Layer)                     │
-│     ColumnConverter + Template + Renderer                 │
-│     - 字段映射（列名 → 实体属性提取器）                    │
-│     - 数据格式化（日期、时长、金额、布尔值等）              │
-│     - 多格式驱动（CSV / XLSX / PDF / HTML）               │
-└─────────────────────────────┬─────────────────────────────┘
-                              │
-┌─────────────────────────────▼─────────────────────────────┐
-│  5. 文件下载响应层 (Response Assembly Layer)              │
-│     BinaryFileResponse + ResponseHeaderBag                │
-│     - 组装 HTTP 下载响应头                                │
-│     - 临时文件生命周期管理                                │
-└───────────────────────────────────────────────────────────┘
-```
+| 系统 | 服务场景 | 数据模型 | 模板方式 | 输出格式 |
+|-----|---------|---------|---------|---------|
+| **工时导出** (Export) | 原始工时数据表格导出 | `ExportableItem` 实体数组 | 列定义 + 动态元字段 | CSV / XLSX / PDF / HTML |
+| **发票导出** (Invoice) | 正式发票文档生成 | `InvoiceModel` + `InvoiceItem` | Twig 模板 / Excel 模板文件 | PDF / XLSX / ODS / DOCX / HTML |
+
+两者共享部分基础设施（如 `PdfRendererTrait`、`BinaryFileResponse`），但**字段转换方式、格式驱动机制、文件生命周期管理完全不同**。
 
 ---
 
-## 1. 控制器层：请求入口与流程编排
+## 第一部分：工时导出管道（Export Pipeline）
 
-### 1.1 工时导出控制器
+### 1.1 控制器层：请求入口与流程编排
 
 **核心文件**: [ExportController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Controller/ExportController.php)
 
-导出请求处理流程位于 `exportAction()` 方法（第 125-162 行）：
+导出请求处理流程位于 `export()` 方法（第 125-162 行）：
 
 ```php
 #[Route(path: '/data', name: 'export_data', methods: ['POST'])]
@@ -80,27 +50,9 @@ public function export(Request $request, SystemConfiguration $systemConfiguratio
 - **超时保护**: 临时提升 `max_execution_time` 防止大数据导出超时
 - **内联预览**: 若渲染器实现 `DispositionInlineInterface` 且未勾选"标记为已导出"，则在浏览器内联显示而非下载
 
-### 1.2 发票下载控制器
+### 1.2 领域查询层：查询对象与数据获取
 
-**核心文件**: [InvoiceController.php](file:///d:/fz/0601-2\solo-dogfeeding/code/17-kimai/src/Controller/InvoiceController.php)
-
-发票下载位于 `downloadAction()` 方法（第 301-312 行）：
-
-```php
-public function downloadAction(Invoice $invoice, InvoiceService $service): Response
-{
-    $file = $service->getInvoiceFile($invoice);
-    return $this->file($file->getRealPath(), $file->getBasename());
-}
-```
-
-发票导出与工时导出共享相同的格式适配层，但数据获取路径不同，走 `InvoiceService` → `InvoiceQuery` 分支。
-
----
-
-## 2. 领域查询层：查询对象与数据获取
-
-### 2.1 查询对象继承体系
+#### 查询对象继承体系
 
 ```
 BaseQuery (基础查询，分页/排序)
@@ -113,12 +65,9 @@ TimesheetQuery (工时查询核心，状态/用户/标签等)
 └─ InvoiceQuery (发票专用，新增 template / invoiceDate)
 ```
 
-**核心文件**:
-- [ExportQuery.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Repository/Query/ExportQuery.php)
-- [InvoiceQuery.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Repository/Query/InvoiceQuery.php)
-- [TimesheetQuery.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Repository/Query/TimesheetQuery.php)
+#### ExportQuery 导出专用属性
 
-### 2.2 ExportQuery 导出专用属性
+**核心文件**: [ExportQuery.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Repository/Query/ExportQuery.php)
 
 ```php
 class ExportQuery extends TimesheetQuery
@@ -138,7 +87,7 @@ class ExportQuery extends TimesheetQuery
 }
 ```
 
-### 2.3 数据仓库接口与实现
+#### 数据仓库接口与实现
 
 **核心接口**: [ExportRepositoryInterface.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/ExportRepositoryInterface.php)
 
@@ -158,7 +107,7 @@ final class TimesheetExportRepository implements ExportRepositoryInterface
 {
     public function getExportItemsForQuery(ExportQuery $query): iterable
     {
-        // 添加关联数据预加载提示
+        // 添加关联数据预加载提示（元字段、用户偏好等）
         $query->addQueryHint(TimesheetQueryHint::CUSTOMER_META_FIELDS);
         $query->addQueryHint(TimesheetQueryHint::PROJECT_META_FIELDS);
         $query->addQueryHint(TimesheetQueryHint::ACTIVITY_META_FIELDS);
@@ -170,7 +119,7 @@ final class TimesheetExportRepository implements ExportRepositoryInterface
 }
 ```
 
-### 2.4 服务层数据聚合
+#### 服务层数据聚合
 
 **核心文件**: [ServiceExport.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/ServiceExport.php)
 
@@ -197,16 +146,14 @@ public function getExportItems(ExportQuery $query): array
 - **数据聚合**: 支持多种可导出实体类型（工时、发票条目等）统一查询
 - **安全限制**: 通过 `ExportItemsQueryEvent` 事件可动态设置最大导出条数
 
----
+### 1.3 格式适配层：字段映射与多格式驱动
 
-## 3. 格式适配层：字段映射与多格式驱动
-
-格式适配层是导出系统最复杂的部分，由三类核心对象协作完成：
+格式适配层是工时导出系统最复杂的部分，由三类核心对象协作完成：
 1. **Template** - 定义要导出哪些列
 2. **ColumnConverter** - 将列名转换为带提取器和格式化器的 `Column` 对象
 3. **Renderer** - 驱动具体格式（CSV/XLSX/PDF）的渲染
 
-### 3.1 模板体系
+#### 模板体系
 
 **核心接口**: [TemplateInterface.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/TemplateInterface.php)
 
@@ -223,7 +170,7 @@ interface TemplateInterface
 
 **默认模板实现**: [DefaultTemplate.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/DefaultTemplate.php)
 
-`getColumns()` 方法定义了默认导出列（第 75-144 行）：
+`getColumns()` 方法定义了默认导出列（第 75-144 行），包含约 30 个固定列 + 动态元字段列：
 
 ```php
 public function getColumns(TimesheetQuery $query): array
@@ -251,11 +198,11 @@ public function getColumns(TimesheetQuery $query): array
 - 支持用户在界面配置导出列，存储在 `ExportTemplate` 实体中
 - `ServiceExport::createTemplateFromExportTemplate()` 负责转换
 
-### 3.2 列转换器：字段映射的核心
+#### 列转换器：字段映射的核心
 
 **核心文件**: [ColumnConverter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/ColumnConverter.php)
 
-`getColumns()` 方法（第 105-259 行）是整个导出系统的**字段映射中枢**，它：
+`getColumns()` 方法（第 105-259 行）是工时导出系统的**字段映射中枢**，它：
 
 1. **动态发现元字段**（第 109-164 行）：通过事件系统发现 timesheet/customer/project/activity/user 的自定义元字段
 
@@ -280,7 +227,7 @@ elseif (str_starts_with($column, 'timesheet.meta.') && isset($timesheetMeta[$col
 }
 ```
 
-### 3.3 Column 对象：提取 + 格式化
+#### Column 对象：提取 + 格式化
 
 **核心文件**: [Column.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/Package/Column.php)
 
@@ -308,7 +255,7 @@ class Column
 }
 ```
 
-### 3.4 单元格格式化器
+#### 单元格格式化器
 
 位于 `src/Export/Package/CellFormatter/` 目录，实现 `CellFormatterInterface`：
 
@@ -323,7 +270,7 @@ class Column
 | `ArrayFormatter` | 数组格式化（标签） | `tag1, tag2` |
 | `TextFormatter` | 文本格式化（自动换行） | |
 
-### 3.5 渲染器工厂与多格式驱动
+#### 渲染器工厂与多格式驱动
 
 **渲染器创建流程**:
 `ServiceExport::getRenderer()` → `XxxRendererFactory::create()` → 具体 `Renderer` 实例
@@ -334,7 +281,7 @@ class Column
 - [PdfRendererFactory.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/Renderer/PdfRendererFactory.php)
 - [HtmlRendererFactory.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/Renderer/HtmlRendererFactory.php)
 
-#### 3.5.1 CSV 渲染器
+##### CSV 渲染器
 
 **核心文件**: [CsvRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/Base/CsvRenderer.php)
 
@@ -371,7 +318,7 @@ final class CsvRenderer extends AbstractSpreadsheetRenderer
 }
 ```
 
-#### 3.5.2 XLSX 渲染器
+##### XLSX 渲染器
 
 **核心文件**: [XlsxRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/Base/XlsxRenderer.php)
 
@@ -381,7 +328,7 @@ final class CsvRenderer extends AbstractSpreadsheetRenderer
 - 文件扩展名为 `.xlsx`
 - 保留富格式化（日期格式、列宽、自动筛选、汇总公式）
 
-#### 3.5.3 电子表格通用写入逻辑
+##### 电子表格通用写入逻辑
 
 **核心文件**: [AbstractSpreadsheetRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/Base/AbstractSpreadsheetRenderer.php)
 
@@ -421,7 +368,7 @@ protected function writeSpreadsheet(ColumnConverter $converter, TemplateInterfac
 }
 ```
 
-#### 3.5.4 PDF 渲染器
+##### PDF 渲染器
 
 **核心文件**: [PDFRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/Base/PDFRenderer.php)
 
@@ -458,11 +405,9 @@ public function render(array $exportItems, TimesheetQuery $query): Response
 }
 ```
 
----
+### 1.4 文件下载响应层：响应组装与临时文件管理
 
-## 4. 文件下载响应层：响应组装与临时文件管理
-
-### 4.1 电子表格格式响应
+#### 电子表格格式响应
 
 **核心文件**: [AbstractSpreadsheetRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/Base/AbstractSpreadsheetRenderer.php#L35-L45)
 
@@ -483,7 +428,7 @@ protected function getFileResponse(string $file, string $filename, string $conte
 }
 ```
 
-### 4.2 PDF 格式响应
+#### PDF 格式响应
 
 **核心文件**: [PdfRendererTrait.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Pdf/PdfRendererTrait.php#L25-L42)
 
@@ -507,30 +452,7 @@ protected function createPdfResponse(string $content, PdfContext $context): Resp
 }
 ```
 
-### 4.3 发票系统的响应组装
-
-**核心文件**: [AbstractRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/Renderer/AbstractRenderer.php#L46-L56)
-
-发票系统有自己独立的响应组装逻辑，与工时导出保持一致模式：
-
-```php
-protected function getFileResponse(mixed $file, string $filename): BinaryFileResponse
-{
-    $response = new BinaryFileResponse($file);
-    $disposition = $response->headers->makeDisposition(
-        ResponseHeaderBag::DISPOSITION_ATTACHMENT, 
-        $filename
-    );
-
-    $response->headers->set('Content-Type', $this->getContentType());
-    $response->headers->set('Content-Disposition', $disposition);
-    $response->deleteFileAfterSend(true);
-
-    return $response;
-}
-```
-
-### 4.4 导出文件名生成
+#### 导出文件名生成
 
 **核心文件**: [ExportFilename.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/ExportFilename.php)
 
@@ -560,100 +482,631 @@ public function getFilename(): string
 
 ---
 
-## 5. 完整调用链示例
+## 第二部分：发票导出管道（Invoice Pipeline）
 
-### 5.1 工时导出为 XLSX 的完整调用链
+### 2.1 控制器层：三张发票入口
+
+**核心文件**: [InvoiceController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Controller/InvoiceController.php)
+
+发票系统有三个关键入口：
+
+| 路由 | 方法 | 作用 |
+|-----|------|------|
+| `/invoice/` | `indexAction()` | 发票预览列表页，按客户分组展示可开票条目 |
+| `/invoice/preview/{customer}/{token}` | `previewAction()` | 单客户发票预览（内联显示） |
+| `/invoice/save-invoice/{customer}/{token}` | `createInvoiceAction()` | 正式创建发票，生成文件并保存 |
+| `/invoice/download/{id}` | `downloadAction()` | 下载已生成的发票文件 |
+
+#### 发票创建流程入口
+
+`createInvoiceAction()` 方法（第 175-214 行）：
+
+```php
+public function createInvoiceAction(Customer $customer, string $token, Request $request, 
+                                     CustomerRepository $customerRepository, InvoiceService $service): Response
+{
+    $query = $this->getDefaultQuery();
+    $query->setAllowTemplateOverwrite(false);
+    $form = $this->getToolbarForm($query);
+    $form->handleRequest($request);
+
+    if ($form->isValid()) {
+        $query->setCustomers([$customer]);
+        $model = $service->createModel($query);   // 1. 构建发票模型
+
+        // 保存默认模板给客户
+        if ($customer->getInvoiceTemplate() === null) {
+            $customer->setInvoiceTemplate($query->getTemplate());
+            $customerRepository->saveCustomer($customer);
+        }
+
+        $invoice = $service->createInvoice($model, $this->dispatcher);  // 2. 生成发票
+        $this->flashSuccess('action.update.success');
+
+        return $this->redirectToRoute('admin_invoice_list', ['id' => $invoice->getId()]);
+    }
+}
+```
+
+#### 发票下载入口
+
+`downloadAction()` 方法（第 301-312 行）：
+
+```php
+public function downloadAction(Invoice $invoice, InvoiceService $service): Response
+{
+    $file = $service->getInvoiceFile($invoice);
+    if (null === $file) {
+        throw $this->createNotFoundException(...);
+    }
+    return $this->file($file->getRealPath(), $file->getBasename());
+}
+```
+
+### 2.2 领域层：InvoiceModel 与计算体系
+
+发票系统的数据核心是 `InvoiceModel`，它是一个**富领域模型**，封装了发票所需的全部数据和计算逻辑。
+
+#### InvoiceModel：发票数据聚合根
+
+**核心文件**: [InvoiceModel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/InvoiceModel.php)
+
+```php
+final class InvoiceModel
+{
+    private ?InvoiceQuery $query = null;
+    /** @var ExportableItem[] */
+    private array $entries = [];                  // 原始可导出条目
+    private ?CalculatorInterface $calculator = null; // 计算器（按不同方式聚合条目）
+    private ?NumberGeneratorInterface $generator = null; // 发票号生成器
+    private \DateTimeInterface $invoiceDate;
+    private InvoiceFormatter $formatter;          // 本地化格式化器
+    private readonly Customer $customer;
+    private readonly InvoiceTemplate $template;
+    private readonly RateCalculatorMode $rateCalculatorMode;
+    
+    /** @var InvoiceModelHydrator[] */
+    private array $modelHydrator = [];            // 模型水化器（转为模板变量）
+    /** @var InvoiceItemHydrator[] */
+    private array $itemHydrator = [];             // 条目水化器（转为模板变量）
+    
+    private ?string $invoiceNumber = null;
+    private array $options = [];
+}
+```
+
+**关键方法**:
+- `getCalculator()->getEntries()` — 返回经过计算器聚合后的 `InvoiceItem[]`（不是原始 `ExportableItem`）
+- `toArray()` — 通过 Hydrator 将整个模型转为模板可用的键值对数组
+- `itemToArray(InvoiceItem $item)` — 将单条发票条目转为键值对数组
+
+#### 数据流转：从 ExportableItem 到 InvoiceItem
 
 ```
-1. HTTP POST /export/data
-   ↓
-2. ExportController::exportAction()
-   ├─ 创建 ExportQuery，绑定表单参数
-   ├─ ServiceExport::getRendererById('xlsx') → XlsxRenderer
-   └─ getEntries($query)
-      └─ ServiceExport::getExportItems()
-         └─ TimesheetExportRepository::getExportItemsForQuery()
-            └─ TimesheetRepository::getTimesheetResult()
-               └─ Doctrine QueryBuilder → SQL → Timesheet[]
-   ↓
-3. XlsxRenderer::render($entries, $query)
-   ├─ 临时文件: tempnam(sys_get_temp_dir(), 'kimai-export-xlsx')
-   ├─ 创建 SpoutSpreadsheet(XLSX Writer)
-   └─ AbstractSpreadsheetRenderer::writeSpreadsheet()
-      ├─ ColumnConverter::getColumns($template, $query)
-      │  ├─ DefaultTemplate::getColumns() → 列名数组
-      │  └─ 为每个列名创建 Column 对象（含提取器+格式化器）
-      ├─ SpoutSpreadsheet::setColumns() → 写入表头（翻译）
-      ├─ 遍历 entries，逐行调用 Column::getValue()
-      │  └─ 提取器闭包 → 原始值 → 格式化器 → 单元格值
-      ├─ 写入汇总行（SUBTOTAL 公式）
-      └─ SpoutSpreadsheet::save() → XLSX 文件写入磁盘
-   ↓
-4. AbstractSpreadsheetRenderer::getFileResponse()
-   ├─ BinaryFileResponse 包装临时文件
-   ├─ Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
-   ├─ Content-Disposition: attachment; filename="20240115-ACME.xlsx"
-   └─ deleteFileAfterSend(true)
-   ↓
-5. HTTP 响应 → 浏览器下载文件
+原始数据: ExportableItem[] (如 Timesheet 实体)
+      ↓ (通过 CalculatorInterface)
+聚合结果: InvoiceItem[] (按项目/活动/日期/用户等维度聚合)
+      ↓ (通过 InvoiceItemHydrator)
+模板变量: array (键值对，如 entry.description, entry.rate 等)
 ```
 
-### 5.2 发票导出为 PDF 的调用链
+#### Calculator 体系：条目聚合策略
+
+**核心接口**: [CalculatorInterface.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/CalculatorInterface.php)
+
+位于 `src/Invoice/Calculator/` 目录，提供多种聚合策略：
+
+| 计算器 | 聚合维度 | 适用场景 |
+|-------|---------|---------|
+| `DefaultCalculator` | 逐条展示（不聚合） | 明细发票 |
+| `ShortInvoiceCalculator` | 极简展示 | 简短发票 |
+| `ActivityInvoiceCalculator` | 按活动聚合 | 按活动分类 |
+| `ProjectInvoiceCalculator` | 按项目聚合 | 按项目分类 |
+| `DateInvoiceCalculator` | 按日期聚合 | 按日期分类 |
+| `UserInvoiceCalculator` | 按用户聚合 | 按人员分类 |
+| `PriceInvoiceCalculator` | 按价格聚合 | 按费率分类 |
+| `WeeklyInvoiceCalculator` | 按周聚合 | 周报式发票 |
+
+#### 条目仓库：InvoiceItemRepositoryInterface
+
+**核心接口**: [InvoiceItemRepositoryInterface.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/InvoiceItemRepositoryInterface.php)
+
+```php
+interface InvoiceItemRepositoryInterface
+{
+    public function getInvoiceItemsForQuery(InvoiceQuery $query): iterable;
+    public function setExported(array $invoiceItems): void;
+}
+```
+
+**工时条目仓库实现**: [TimesheetInvoiceItemRepository.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Repository/TimesheetInvoiceItemRepository.php)
+
+与工时导出的 `TimesheetExportRepository` 几乎完全相同，只是接口不同。两者底层都调用 `TimesheetRepository::getTimesheetResult()`。
+
+### 2.3 字段转换：Hydrator 水化器体系
+
+发票系统不使用 `ColumnConverter`，而是使用 **Hydrator 模式**进行字段转换。这是与工时导出最核心的区别。
+
+#### 两种 Hydrator 接口
+
+- **InvoiceModelHydrator** — 将 `InvoiceModel` 转为模板变量数组（发票级字段）
+- **InvoiceItemHydrator** — 将 `InvoiceItem` 转为模板变量数组（条目级字段）
+
+#### 发票模型水化器
+
+**核心实现**: [InvoiceModelDefaultHydrator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/Hydrator/InvoiceModelDefaultHydrator.php)
+
+`hydrate()` 方法返回约 80+ 个模板变量，分类包括：
 
 ```
-1. InvoiceController::createAction()
+invoice.*           发票信息（日期、编号、金额、税额、小计、总计等）
+template.*          模板配置（公司名称、地址、付款条款等）
+query.*             查询条件（起止日期、活动、项目等）
+invoice.tax_rows[]  税项明细数组
+```
+
+部分示例：
+
+```php
+public function hydrate(InvoiceModel $model): array
+{
+    return [
+        'invoice.date'       => $formatter->getFormattedDateTime($model->getInvoiceDate()),
+        'invoice.date_process' => $model->getInvoiceDate()->format('Y-m-d h:i:s'),
+        'invoice.number'     => $model->getInvoiceNumber(),
+        'invoice.currency'   => $currency,
+        'invoice.total'      => $formatter->getFormattedMoney($total, $currency),
+        'invoice.total_plain' => $total,
+        'invoice.subtotal'   => $formatter->getFormattedMoney($subtotal, $currency),
+        'invoice.total_time' => $formatter->getFormattedDuration($calculator->getTimeWorked()),
+        'template.company'   => $template->getCompany() ?? '',
+        'template.address'   => $template->getAddress() ?? '',
+        'query.begin'        => $formatter->getFormattedDateTime($begin),
+        'query.begin_year'   => $begin->format('Y'),
+        // ... 80+ 个字段
+    ];
+}
+```
+
+#### 发票条目水化器
+
+**核心实现**: [InvoiceItemDefaultHydrator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/Hydrator/InvoiceItemDefaultHydrator.php)
+
+每个 `InvoiceItem` 被转换为约 50+ 个模板变量：
+
+```
+entry.row               行号
+entry.description       描述
+entry.amount            数量（小时数或次数）
+entry.rate              单价（已格式化）
+entry.rate_plain        单价（原始数值）
+entry.total             行总计（已格式化）
+entry.total_plain       行总计（原始数值）
+entry.duration          时长（秒）
+entry.duration_format   时长（已格式化）
+entry.duration_decimal  时长（十进制）
+entry.date              日期
+entry.begin             开始时间
+entry.end               结束时间
+entry.activity          活动名称
+entry.project           项目名称
+entry.user_name         用户名称
+entry.user_display      用户显示名
+entry.tags              标签
+entry.category          分类
+entry.type              类型
+entry.activity.meta.*   活动元字段
+entry.project.meta.*    项目元字段
+entry.meta.*            附加字段
+```
+
+#### Hydrator vs ColumnConverter 对比
+
+| 对比维度 | 工时导出 ColumnConverter | 发票导出 Hydrator |
+|---------|------------------------|-------------------|
+| 输出形式 | `Column[]` 对象数组 | 扁平 `key => value` 数组 |
+| 字段选择 | 由 Template 定义要导出哪些列 | 固定输出全部字段，模板按需引用 |
+| 扩展方式 | 新增列名 → 新增 if-elseif 分支 | 新增 Hydrator 实现，数组 merge |
+| 格式化时机 | 渲染时动态调用 `getValue()` | 水化时一次性计算好所有格式 |
+| 权限控制 | 列级别权限（如 rate 列需权限） | 模板自行控制展示 |
+| 模板绑定 | 列名是模板的一部分 | 变量名是模板约定的一部分 |
+
+### 2.4 模板渲染：双轨制模板引擎
+
+发票系统支持**两类模板**，使用不同的渲染机制：
+
+#### 第一类：Twig 模板（PDF / HTML）
+
+**核心文件**: [AbstractTwigRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/Renderer/AbstractTwigRenderer.php)
+
+通过文件扩展名识别：
+- `.pdf.twig` → `PdfRenderer` 渲染
+- `.html.twig` → `TwigRenderer` 渲染
+
+渲染流程（第 31-52 行）：
+
+```php
+protected function renderTwigTemplate(InvoiceDocument $document, InvoiceModel $model, array $options = []): string
+{
+    $language = $model->getTemplate()->getLanguage();
+    $formatLocale = $model->getFormatter()->getLocale();
+    $template = '@invoice/' . basename($document->getFilename());
+    
+    // 条目级：将 InvoiceItem 全部转为数组
+    $entries = [];
+    foreach ($model->getCalculator()->getEntries() as $entry) {
+        $entries[] = $model->itemToArray($entry);
+    }
+
+    $options = array_merge([
+        'model' => $model,          // 整个模型对象（旧方式）
+        'invoice' => $model->toArray(), // 模型级变量（推荐方式）
+        'entries' => $entries       // 条目级变量数组
+    ], $options);
+
+    return $this->renderTwigTemplateWithLanguage($this->twig, $template, $options, $language, $formatLocale);
+}
+```
+
+**关键特性**:
+- **语言切换**: 渲染前切换翻译和格式化语言，渲染后恢复
+- **Twig 沙箱**: 使用 `SandboxExtension` + `StrictPolicy` 限制模板能力
+- **变量约定**: `invoice.*` 是发票级变量，`entries[i].*` 是条目级变量
+
+##### PDF 渲染器
+
+**核心文件**: [PdfRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/Renderer/PdfRenderer.php)
+
+```php
+final class PdfRenderer extends AbstractTwigRenderer implements DispositionInlineInterface
+{
+    use PDFRendererTrait;
+
+    public function render(InvoiceDocument $document, InvoiceModel $model): Response
+    {
+        $filename = new InvoiceFilename($model);
+        $context = new PdfContext();
+        $context->setOption('filename', $filename->getFilename());
+        $context->setOption('margin_top', '12');
+        $context->setOption('margin_bottom', '8');
+
+        // 1. Twig 渲染 HTML
+        $content = $this->renderTwigTemplate($document, $model, ['pdfContext' => $context]);
+        // 2. HTML → PDF 转换
+        $content = $this->converter->convertToPdf($content, array_merge($model->getOptions(), $context->getOptions()));
+        // 3. 组装响应
+        return $this->createPdfResponse($content, $context);
+    }
+}
+```
+
+#### 第二类：电子表格模板（XLSX / ODS）
+
+**核心文件**: [AbstractSpreadsheetRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/Renderer/AbstractSpreadsheetRenderer.php)
+
+通过文件扩展名识别：
+- `.xlsx` / `.xls` → `XlsxRenderer` 渲染
+- `.ods` → `OdsRenderer` 渲染
+
+**与工时导出的本质区别**：
+- 工时导出：根据列定义**动态生成**表格结构
+- 发票导出：基于已有的 Excel 模板文件**替换占位符**
+
+渲染核心逻辑（第 39-117 行）：
+
+```php
+public function render(InvoiceDocument $document, InvoiceModel $model): Response
+{
+    $spreadsheet = IOFactory::load($document->getFilename());  // 1. 加载模板文件
+    $worksheet = $spreadsheet->getActiveSheet();
+    $entries = $model->getCalculator()->getEntries();
+    $sheetReplacer = $model->toArray();                       // 2. 模型级替换变量
+    
+    // 3. 如果有多条数据，先插入模板行（复制首条数据行的格式）
+    if ($invoiceItemCount > 1) {
+        $this->addTemplateRows($worksheet, $invoiceItemCount);
+    }
+    
+    // 4. 遍历每一行，替换 ${...} 占位符
+    foreach ($worksheet->getRowIterator() as $row) {
+        foreach ($row->getCellIterator() as $cell) {
+            $value = $cell->getValue();
+            
+            if (stripos($value, '${entry.') !== false) {
+                // 条目级变量：${entry.description}, ${entry.total} 等
+                $replacer = $sheetValues; // 当前条目对应的数组
+            } elseif (stripos($value, '${') !== false) {
+                // 模型级变量：${invoice.number}, ${invoice.total} 等
+                $replacer = $sheetReplacer;
+            }
+            
+            // 字符串替换所有占位符
+            foreach ($replacer as $key => $content) {
+                $searchKey = '${' . $key . '}';
+                $value = str_replace($searchKey, $content ?? '', $value);
+            }
+            
+            $cell->setValue($value);
+        }
+    }
+    
+    // 5. 保存并返回文件响应
+    $filename = $this->saveSpreadsheet($spreadsheet);
+    return $this->getFileResponse($filename, $userFilename);
+}
+```
+
+**关键机制**:
+- **占位符约定**: 模板中使用 `${变量名}` 作为占位符
+- **模型级变量**: `${invoice.number}`, `${invoice.total}`, `${template.company}` 等
+- **条目级变量**: `${entry.description}`, `${entry.rate}`, `${entry.total}` 等
+- **行扩展**: 找到第一个含 `${entry.` 的行，向下复制 N-1 行，再逐行替换
+- **公式兼容**: 支持公式中嵌入占位符，如 `=IF("${entry.category}"="work";"${entry.activity}";"")`
+
+### 2.5 文件保存与下载：持久化生命周期
+
+发票文件的生命周期与工时导出截然不同：
+- **工时导出**: 一次性生成，临时文件，响应发送后即删除
+- **发票导出**: 生成后持久化保存，后续可多次下载
+
+#### 发票生成与保存
+
+**核心文件**: [InvoiceService.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/InvoiceService.php)
+
+`createInvoice()` 方法（第 320-366 行）完整流程：
+
+```php
+public function createInvoice(InvoiceModel $model, EventDispatcherInterface $dispatcher): Invoice
+{
+    $document = $this->getDocumentByName($model->getTemplate()->getRenderer());
+    
+    foreach ($this->getRenderer() as $renderer) {
+        if ($renderer->supports($document)) {
+            $preEvent = new InvoicePreRenderEvent($model, $document, $renderer);
+            $dispatcher->dispatch($preEvent);
+            
+            // 1. 发票号查重
+            if ($this->invoiceRepository->hasInvoice($model->getInvoiceNumber())) {
+                throw new DuplicateInvoiceNumberException($model->getInvoiceNumber());
+            }
+            
+            // 2. 渲染生成文件响应
+            $response = $renderer->render($document, $model);
+            
+            $event = new InvoicePostRenderEvent($model, $document, $renderer, $response);
+            $dispatcher->dispatch($event);
+            
+            // 3. 从响应中提取文件，保存到 var/data/invoices/
+            $invoiceFilename = $this->saveGeneratedInvoice($event);
+            
+            // 4. 创建 Invoice 实体并持久化到数据库
+            $invoice = new Invoice();
+            $invoice->setModel($model);
+            $invoice->setFilename($invoiceFilename);
+            $this->saveInvoice($invoice);
+            
+            // 5. 将关联条目标记为已导出
+            $this->markEntriesAsExported($model->getEntries());
+            
+            $dispatcher->dispatch(new InvoiceCreatedEvent($invoice, $model));
+            
+            return $invoice;
+        }
+    }
+}
+```
+
+#### 文件保存细节
+
+`saveGeneratedInvoice()` 方法（第 191-237 行）：
+
+```php
+public function saveGeneratedInvoice(InvoicePostRenderEvent $event): string
+{
+    $invoiceDirectory = $this->getInvoicesDirectory();  // var/data/invoices/
+    $filename = (string) new InvoiceFilename($event->getModel());
+    
+    $response = $event->getResponse();
+    
+    if ($response instanceof BinaryFileResponse) {
+        // 电子表格格式：直接移动临时文件
+        $file = $response->getFile();
+        $file->move($invoiceDirectory, $filename);
+    } else {
+        // PDF 等格式：从响应体提取内容并保存
+        $this->fileHelper->saveFile($invoiceDirectory . $filename, $event->getResponse()->getContent());
+    }
+    
+    return $filename;
+}
+```
+
+#### 发票文件名生成
+
+**核心文件**: [InvoiceFilename.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/InvoiceFilename.php)
+
+```php
+final class InvoiceFilename
+{
+    public function __construct(InvoiceModel $model)
+    {
+        $filename = $model->getInvoiceNumber();  // 基础：发票号
+        
+        $company = $model->getCustomer()->getCompany();
+        if (empty($company)) {
+            $company = $model->getCustomer()->getName();
+        }
+        if (!empty($company)) {
+            $filename .= '-' . $this->convert($company);  // 追加公司名
+        }
+        
+        // 单个项目时追加项目名
+        $projects = $model->getQuery()->getProjects();
+        if (count($projects) === 1) {
+            $filename .= '-' . $this->convert($projects[0]->getName());
+        }
+        
+        $this->filename = $filename;
+    }
+}
+```
+
+**示例**: `INV-2024-00123-ACME_Corp-Website_Redesign.pdf`
+
+#### 文件下载
+
+从数据库加载 `Invoice` 实体 → 通过文件名从 `var/data/invoices/` 读取文件 → 调用 `$this->file()` 返回。
+
+**发票系统的响应组装**（与工时导出机制相同，但位于独立基类）：
+
+**核心文件**: [AbstractRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/Renderer/AbstractRenderer.php#L46-L56)
+
+```php
+protected function getFileResponse(mixed $file, string $filename): BinaryFileResponse
+{
+    $response = new BinaryFileResponse($file);
+    $disposition = $response->headers->makeDisposition(
+        ResponseHeaderBag::DISPOSITION_ATTACHMENT, 
+        $filename
+    );
+
+    $response->headers->set('Content-Type', $this->getContentType());
+    $response->headers->set('Content-Disposition', $disposition);
+    $response->deleteFileAfterSend(true);  // 注意：这里删的是临时文件，不是保存后的发票文件
+
+    return $response;
+}
+```
+
+### 2.6 完整调用链：发票生成到归档
+
+```
+1. HTTP GET /invoice/save-invoice/{customer}/{token}
    ↓
-2. InvoiceService::createInvoice()
-   ├─ InvoiceQuery 构建查询条件
-   ├─ 获取 InvoiceModel（含客户、模板、条目列表）
-   └─ 选择渲染器（基于模板文件扩展名）
+2. InvoiceController::createInvoiceAction()
+   ├─ 创建 InvoiceQuery，绑定表单参数
+   └─ InvoiceService::createInvoice($model, $dispatcher)
+      ├─ InvoiceService::createModel($query)
+      │  ├─ 从 InvoiceTemplate 获取 calculator / numberGenerator
+      │  ├─ InvoiceModelFactory 创建 InvoiceModel
+      │  ├─ 注入所有 Hydrator
+      │  └─ InvoiceService::getInvoiceItems() → TimesheetInvoiceItemRepository
+      │     └→ TimesheetRepository::getTimesheetResult() → ExportableItem[]
+      │
+      ├─ InvoicePreRenderEvent 分发
+      ├─ 发票号查重
+      ├─ 选择渲染器（基于模板文件扩展名）
+      │
+      ├─ [PDF 路径] PdfRenderer::render()
+      │  ├─ AbstractTwigRenderer::renderTwigTemplate()
+      │  │  ├─ InvoiceModel::toArray() → 模型级变量
+      │  │  │  └─ 遍历所有 InvoiceModelHydrator，合并结果
+      │  │  ├─ InvoiceItem[] → 条目级变量数组
+      │  │  │  └─ 遍历所有 InvoiceItemHydrator，合并结果
+      │  │  ├─ 切换翻译语言和格式化 locale
+      │  │  ├─ 启用 Twig 沙箱
+      │  │  └─ Twig 渲染模板
+      │  ├─ HtmlToPdfConverter::convertToPdf()
+      │  └─ createPdfResponse() → Response
+      │
+      ├─ [XLSX 路径] XlsxRenderer::render()
+      │  ├─ IOFactory::load() 加载模板文件
+      │  ├─ InvoiceModel::toArray() → 模型级替换变量
+      │  ├─ addTemplateRows() 扩展数据行
+      │  ├─ 遍历所有单元格，替换 ${...} 占位符
+      │  ├─ saveSpreadsheet() → 临时文件
+      │  └─ getFileResponse() → BinaryFileResponse
+      │
+      ├─ InvoicePostRenderEvent 分发
+      ├─ saveGeneratedInvoice()
+      │  └─ 文件保存到 var/data/invoices/
+      ├─ 创建 Invoice 实体并入库
+      ├─ markEntriesAsExported() → 标记工时为已导出
+      └─ InvoiceCreatedEvent 分发
    ↓
-3. Invoice\Renderer\PdfRenderer::render($model)
-   ├─ Twig 渲染 HTML（使用 invoice.pdf.twig 模板）
-   ├─ HtmlToPdfConverter::convertToPdf()
-   └─ createPdfResponse()
-      └─ Response 组装 + Content-Disposition 头
+3. 重定向到发票列表页
+
+4. （后续）HTTP GET /invoice/download/{id}
    ↓
-4. 存储发票文件到 var/data/invoices/
-   ↓
-5. 后续下载走 InvoiceController::downloadAction()
-   └─ $this->file($file->getRealPath(), $filename)
+5. InvoiceController::downloadAction()
+   ├─ InvoiceService::getInvoiceFile() → var/data/invoices/ 下的文件
+   └─ $this->file() → BinaryFileResponse
 ```
 
 ---
 
-## 6. 关键设计模式与架构亮点
+## 第三部分：两套导出系统对比
 
-### 6.1 策略模式
-- `CellFormatterInterface` 的多实现处理不同数据类型格式化
-- `ExportRendererInterface` 的多实现支持不同导出格式
+### 3.1 架构对比总表
 
-### 6.2 仓库模式
-- `ExportRepositoryInterface` 抽象数据获取，支持多实体类型导出
+| 对比维度 | 工时导出 (Export) | 发票导出 (Invoice) |
+|---------|------------------|-------------------|
+| **设计目标** | 原始数据的表格化导出 | 正式发票文档的生成与管理 |
+| **数据模型** | `ExportableItem[]` 实体数组 | `InvoiceModel` + `InvoiceItem[]` |
+| **字段转换** | `ColumnConverter` → `Column[]` 对象 | `Hydrator` → `key=>value` 数组 |
+| **模板方式** | 列定义（列名数组） | 模板文件（Twig 或 Excel 文档） |
+| **格式驱动** | 渲染器工厂 + 渲染器接口 | supports() 匹配 + 渲染器接口 |
+| **文件生命周期** | 临时文件，响应后删除 | 持久化保存，可多次下载 |
+| **聚合计算** | 客户端自行处理 / SUBTOTAL 公式 | Calculator 体系，服务器端聚合 |
+| **编号管理** | 无 | NumberGenerator 生成发票号，查重 |
+| **状态流转** | 导出标记（exported 字段） | 发票实体状态（新建/待付/已付/取消） |
+| **权限粒度** | 列级权限（如 rate 列） | 发票级权限（create/view/edit/delete） |
 
-### 6.3 工厂模式
-- `XxxRendererFactory` 封装渲染器创建细节，支持默认模板和用户自定义模板
+### 3.2 字段转换机制对比
 
-### 6.4 事件驱动
-- `ExportItemsQueryEvent` 动态注入导出条数限制
-- `TimesheetMetaDisplayEvent` 等动态发现自定义元字段
+```
+工时导出字段转换流:
+  模板列名 (string)
+      ↓ ColumnConverter::getColumns()
+  Column 对象 (含提取器+格式化器)
+      ↓ Column::getValue($item)
+  单元格值 (mixed)
 
-### 6.5 安全设计
-- Twig 沙箱模式隔离自定义模板代码
-- 权限分级控制（`view_rate_own_timesheet` vs `view_rate_other_timesheet`）
-- 导出条数上限防止 DOS 攻击
+
+发票导出字段转换流:
+  InvoiceItem 对象
+      ↓ InvoiceItemHydrator::hydrate()
+  关联数组 (entry.description, entry.rate, ...)
+      ↓ 模板占位符替换 / Twig 变量引用
+  渲染结果
+```
+
+### 3.3 格式驱动机制对比
+
+| 特性 | 工时导出 | 发票导出 |
+|-----|---------|---------|
+| **渲染器接口** | `ExportRendererInterface` | `RendererInterface` |
+| **渲染方法签名** | `render(array $exportItems, TimesheetQuery $query)` | `render(InvoiceDocument $document, InvoiceModel $model)` |
+| **模板传递** | 通过 `TemplateInterface` 传列定义 | 通过 `InvoiceDocument` 传文件路径 |
+| **格式识别** | 渲染器 ID（如 csv, xlsx） | 文件扩展名匹配（supports 方法） |
+| **电子表格库** | OpenSpout (轻量，快) | PhpSpreadsheet (功能全，支持模板) |
+| **PDF 转换** | 共用 `HtmlToPdfConverter` + `PdfRendererTrait` | 共用 `HtmlToPdfConverter` + `PdfRendererTrait` |
+
+### 3.4 为何有两套独立系统？
+
+两套系统的存在是合理的，因为它们解决的问题本质不同：
+
+1. **工时导出是数据导出**
+   - 目标：把结构化数据交还给用户
+   - 用户关心：列是否齐全、格式是否规范、能否再加工
+   - 特点：动态列选择、元字段扩展、适合数据分析师
+
+2. **发票导出是文档生成**
+   - 目标：生成具有法律效力的正式文档
+   - 用户关心：版式是否专业、数据是否准确、能否满足财务要求
+   - 特点：固定版式模板、精确计算、持久化归档、编号管理
 
 ---
 
-## 7. 核心文件索引表
+## 第四部分：核心文件索引
+
+### 工时导出系统
 
 | 层级 | 文件 | 核心职责 |
 |-----|------|---------|
 | 控制器 | [ExportController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Controller/ExportController.php) | 工时导出 HTTP 入口 |
-| 控制器 | [InvoiceController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Controller/InvoiceController.php) | 发票管理与下载入口 |
 | 服务 | [ServiceExport.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/ServiceExport.php) | 导出服务编排与渲染器管理 |
 | 查询 | [ExportQuery.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Repository/Query/ExportQuery.php) | 导出查询对象 |
-| 查询 | [InvoiceQuery.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Repository/Query/InvoiceQuery.php) | 发票查询对象 |
 | 查询 | [TimesheetQuery.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Repository/Query/TimesheetQuery.php) | 工时查询基类 |
 | 仓库 | [TimesheetExportRepository.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/TimesheetExportRepository.php) | 工时数据获取 |
 | 仓库接口 | [ExportRepositoryInterface.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/ExportRepositoryInterface.php) | 可导出仓库契约 |
@@ -666,8 +1119,30 @@ public function getFilename(): string
 | XLSX 渲染 | [XlsxRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/Base/XlsxRenderer.php) | XLSX 格式渲染 |
 | PDF 渲染 | [PDFRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/Base/PDFRenderer.php) | PDF 格式渲染 |
 | 基类 | [AbstractSpreadsheetRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/Base/AbstractSpreadsheetRenderer.php) | 电子表格通用写入逻辑 |
-| 响应 | [PdfRendererTrait.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Pdf/PdfRendererTrait.php) | PDF 响应组装 |
+| 响应 | [PdfRendererTrait.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Pdf/PdfRendererTrait.php) | PDF 响应组装（共用） |
 | 文件名 | [ExportFilename.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/ExportFilename.php) | 导出文件名生成 |
 | 电子表格包 | [SpoutSpreadsheet.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/Package/SpoutSpreadsheet.php) | OpenSpout 库封装 |
 | 接口 | [ExportRendererInterface.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Export/ExportRendererInterface.php) | 渲染器契约 |
-| 发票渲染基类 | [AbstractRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/Renderer/AbstractRenderer.php) | 发票渲染器基类 |
+
+### 发票导出系统
+
+| 层级 | 文件 | 核心职责 |
+|-----|------|---------|
+| 控制器 | [InvoiceController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Controller/InvoiceController.php) | 发票管理与下载入口 |
+| 服务 | [InvoiceService.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/InvoiceService.php) | 发票服务编排 |
+| 模型 | [InvoiceModel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/InvoiceModel.php) | 发票数据聚合根 |
+| 条目 | [InvoiceItem.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/InvoiceItem.php) | 单条发票条目 |
+| 条目仓库 | [TimesheetInvoiceItemRepository.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Repository/TimesheetInvoiceItemRepository.php) | 工时条目获取 |
+| 计算器接口 | [CalculatorInterface.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/CalculatorInterface.php) | 条目聚合计算器契约 |
+| 模型水化器 | [InvoiceModelDefaultHydrator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/Hydrator/InvoiceModelDefaultHydrator.php) | 模型级字段转换 |
+| 条目水化器 | [InvoiceItemDefaultHydrator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/Hydrator/InvoiceItemDefaultHydrator.php) | 条目级字段转换 |
+| 渲染器接口 | [RendererInterface.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/RendererInterface.php) | 发票渲染器契约 |
+| Twig 基类 | [AbstractTwigRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/Renderer/AbstractTwigRenderer.php) | Twig 模板渲染基类 |
+| 电子表格基类 | [AbstractSpreadsheetRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/Renderer/AbstractSpreadsheetRenderer.php) | 电子表格模板渲染基类 |
+| 基类 | [AbstractRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/Renderer/AbstractRenderer.php) | 所有渲染器基类 |
+| PDF 渲染 | [PdfRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/Renderer/PdfRenderer.php) | PDF 发票渲染 |
+| XLSX 渲染 | [XlsxRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/Renderer/XlsxRenderer.php) | XLSX 发票渲染 |
+| Twig 渲染 | [TwigRenderer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/Renderer/TwigRenderer.php) | HTML 发票渲染 |
+| 文件名 | [InvoiceFilename.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/InvoiceFilename.php) | 发票文件名生成 |
+| 查询 | [InvoiceQuery.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Repository/Query/InvoiceQuery.php) | 发票查询对象 |
+| 编号生成 | [NumberGeneratorInterface.php](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/NumberGeneratorInterface.php) | 发票号生成器契约 |
