@@ -1012,15 +1012,19 @@ protected function getFileResponse(mixed $file, string $filename): BinaryFileRes
   └─ InvoiceService::createModel($query)
      └─ [详见下方 createModel 展开]
 
-步骤 7: 保存客户默认模板（可选）(L196-L199)
-  └─ 若客户未设置模板，将当前模板设为默认
+步骤 7: 保存客户默认模板【第一处】（可选）(L196-L199)
+  ├─ if ($customer->getInvoiceTemplate() === null)
+  ├─ $customer->setInvoiceTemplate($query->getTemplate())
+  └─ CustomerRepository::saveCustomer($customer)
+  【注意：这是在 createInvoice 之前的持久化保存】
 
 步骤 8: 正式创建发票 (L201)
   └─ InvoiceService::createInvoice($model, $dispatcher)
      └─ [详见下方 createInvoice 展开]
 
-步骤 9: 重定向到发票列表 (L205)
-  └─ redirectToRoute('admin_invoice_list')
+步骤 9: 重定向到发票列表（携带新发票ID）(L205)
+  └─ redirectToRoute('admin_invoice_list', ['id' => $invoice->getId()])
+  【注意：通过 query 参数 id 高亮显示刚创建的发票】
 ```
 
 #### 第二阶段：InvoiceModel 构建过程
