@@ -6,18 +6,33 @@
 
 ## 一、总体架构概览
 
-Kimai API 基于 Symfony Security + FOSRestBundle + JMS Serializer 构建，三者的协作可以概括为：
+Kimai API 基于 Symfony Security + FOSRestBundle + JMS Serializer 构建。API 支持三种身份来源，它们在身份认证阶段分道扬镳，在权限投票处产生分支，在用户上下文和序列化阶段汇合。
+
+### 1.1 三种身份来源总览
+
+| 身份来源 | 典型场景 | 进入防火墙 | 核心认证组件 | 是否检查 `api_access` |
+|----------|---------|-----------|-------------|----------------------|
+| **Bearer Token** | 第三方集成、脚本调用 | `api` 防火墙 | `AccessTokenHandler` + `AccessTokenSuccessHandler` | 是 |
+| **旧双 Header** | 历史遗留集成 | `api` 防火墙 | `TokenAuthenticator`（`@deprecated`） | 否 |
+| **已有登录会话** | 前端页面 AJAX 调用 | `secured_area` 防火墙 | 会话自动恢复 | 否 |
+
+### 1.2 共同请求链路
+
+三种身份来源共享以下处理阶段：
 
 ```
-HTTP 请求 → ApiRequestMatcher 路由匹配
-         → AccessTokenHandler / TokenAuthenticator 身份认证
-         → TokenStorage 存储用户令牌
-         → UserEnvironmentSubscriber 注入用户上下文（时区/语言/权限）
-         → ApiVoter 权限校验（IsGranted('API')）
-         → Controller 执行业务逻辑 → 构造 View 对象
-         → ViewHandler 处理分页等包装
-         → JMS Serializer 根据 Groups 注解序列化
-         → JSON 响应返回
+HTTP 请求
+  ├─ 防火墙匹配（此处开始分轨）
+  ├─ 身份认证（分轨执行，各走各的）
+  ├─ Token 存入 TokenStorage（汇合点）
+  ├─ UserEnvironmentSubscriber 注入用户上下文
+  ├─ access_control 第一层检查（IS_AUTHENTICATED_REMEMBERED）
+  ├─ ApiVoter 权限投票（此处产生权限分叉）
+  ├─ 方法级业务权限检查
+  ├─ 控制器业务逻辑
+  ├─ View 构造 + 序列化组选择
+  ├─ JMS Serializer 序列化
+  └─ JSON 响应返回
 ```
 
 核心设计原则：
@@ -25,6 +40,7 @@ HTTP 请求 → ApiRequestMatcher 路由匹配
 - **双轨认证**：Bearer Token（推荐） + X-AUTH-USER/X-AUTH-TOKEN（废弃中）
 - **序列化分组驱动**：通过 `Groups` 注解精确控制输出字段
 - **上下文事件驱动**：通过 `KernelEvents::REQUEST` 事件注入用户环境
+- **按来源差异化授权**：三种身份来源在 `ApiVoter` 中走向不同分支
 
 ---
 
@@ -535,152 +551,479 @@ public function serializeValidationExceptionToJson(...)
 > 这是**用户上下文影响序列化**的一个典型例子：同样的验证错误，不同语言的用户看到的消息不同。
 
 ---
-
 ## 五、三者协作的完整流程
 
-下面以一次典型的 API 请求（`GET /api/timesheets`）为例，串联身份认证、用户上下文、响应序列化的完整交互过程。
+API 请求在身份认证阶段分道扬镳，在用户上下文和序列化阶段汇合。下面按三种身份来源分别展开完整的请求-响应链路。
 
-### 5.1 请求到达与防火墙匹配
+### 5.1 三种身份来源的前置对比
+
+| 维度 | Bearer Token（推荐） | 旧双 Header（废弃） | 已有登录会话 |
+|------|---------------------|-------------------|------------|
+| **典型场景** | 第三方集成、脚本调用 | 历史遗留集成 | 前端 AJAX 调用 |
+| **处理防火墙** | `api`（stateless） | `api`（stateless） | `secured_area`（stateful） |
+| **核心认证组件** | `AccessTokenHandler` | `TokenAuthenticator` | 会话自动恢复 |
+| **认证成功处理器** | `AccessTokenSuccessHandler` | `TokenAuthenticator::onAuthenticationSuccess()` | 默认会话处理器 |
+| **Token 上的 `api-token`** | ✅ 设置为 `true` | ❌ 未设置 | ❌ 未设置 |
+| **ApiVoter 分支** | 检查 `api_access` 权限 | 直接放行 | 直接放行 |
+| **需要的权限** | `IS_AUTHENTICATED_REMEMBERED` + `api_access` | 仅 `IS_AUTHENTICATED_REMEMBERED` | 仅 `IS_AUTHENTICATED_REMEMBERED` |
+| **数据库查询** | 每次查 access_token 表 | 每次查 user 表 + 密码哈希 | 会话中读取，无额外查询 |
+
+### 5.2 共同处理阶段概览
+
+三种身份来源在以下阶段共享相同的处理逻辑：
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    HTTP 请求到达                     │
+└────────────────────────┬────────────────────────────┘
+                         │
+           ┌─────────────┼─────────────┐
+           ▼             ▼             ▼
+    【第一次分叉：防火墙匹配】
+    Bearer Token    旧双 Header    已有会话
+    api 防火墙      api 防火墙    secured_area
+           │             │             │
+           └─────────────┬─────────────┘
+                         ▼
+              【汇合点一：TokenStorage】
+              认证后的 Token 存入 TokenStorage
+                         │
+                         ▼
+              UserEnvironmentSubscriber
+              注入时区 / Locale / 数据可见性
+                         │
+                         ▼
+              access_control 第一层检查
+              IS_AUTHENTICATED_REMEMBERED
+                         │
+                         ▼
+              【第二次分叉：ApiVoter】
+              根据 api-token 属性走不同分支
+                         │
+                         ▼
+              方法级业务权限检查
+                         │
+                         ▼
+              控制器业务逻辑
+                         │
+                         ▼
+              View 构造 + 序列化组选择
+                         │
+                         ▼
+              JMS Serializer 序列化
+                         │
+                         ▼
+              JSON 响应返回
+```
+
+### 5.3 路径一：Bearer Token（新推荐方式）
+
+以 `GET /api/timesheets` 为例，步骤编号 A1-A15：
 
 ```
 请求: GET /api/timesheets
      Authorization: Bearer abc123xyz
 
-1. Symfony HTTP Kernel 接收请求
-2. 防火墙链找到 api 防火墙
-3. ApiRequestMatcher::matches() 返回 true（因为 URL 以 /api/ 开头，且有 Bearer header）
-4. 进入 api 防火墙的认证流程
+A1. Symfony HTTP Kernel 接收请求
+A2. 防火墙链顺序匹配，到达 api 防火墙
+A3. ApiRequestMatcher::matches() 返回 true
+    - URL 以 /api/ 开头 ✓
+    - 有 Authorization: Bearer ... 头 ✓
+    - 进入 api 防火墙
+A4. Symfony 内置 AccessTokenAuthenticator 调用
+    AccessTokenHandler::getUserBadgeFrom('abc123xyz')
+    - 查询 kimai2_access_token 表
+    - 检查 token 是否有效（未过期）
+    - 更新 lastUsage（每分钟最多一次）
+    - 返回 UserBadge（包含 User 对象）
+A5. UserChecker 检查用户状态（启用、未锁定等）
+A6. AccessTokenSuccessHandler::onAuthenticationSuccess()
+    - $token->setAttribute('api-token', true) ← 关键标记
+A7. 【汇合点一】Token 存入 TokenStorage
+A8. UserEnvironmentSubscriber::prepareEnvironment()
+    （KernelEvents::REQUEST, priority -10）
+    - 从 TokenStorage 获取 Token 和 User
+    - date_default_timezone_set($user->getTimezone())
+    - \Locale::setDefault($user->getLocale())
+    - $user->initCanSeeAllData(auth->isGranted('view_all_data'))
+    - 保存 $this->userLocale（供子请求恢复用）
+    - localeFormatExtensions->setLocale($locale)
+A9. access_control 第一层检查
+    - ^/api → IS_AUTHENTICATED_REMEMBERED ✓
+A10. 【第二次分叉】控制器 #[IsGranted('API')] 触发 ApiVoter
+     - 检查用户类型是否为 User
+     - 检查 2FA 状态（进行中则拒绝）
+     - 检测到 token 有 'api-token' 属性
+     - 检查 api_access 权限
+     - 返回 ACCESS_GRANTED
+A11. 方法级权限检查（如 view_own_timesheet）
+A12. 控制器业务逻辑
+     - $this->getUser() 获取当前用户
+     - prepareQuery() 注入 currentUser 和 isApiCall
+     - Repository 根据 currentUser 过滤数据
+     - 返回 Pagination 结果
+A13. 构造 View 对象，设置序列化组
+     - GROUPS_COLLECTION 或 GROUPS_COLLECTION_FULL
+A14. ViewHandler::handle() + JMS Serializer
+     - Pagination → 提取数组 + 设置分页 Header
+     - 根据 Groups 过滤属性
+     - 使用用户时区和 Locale
+A15. 返回 JSON 响应
+     Content-Type: application/json
+     X-Page: 1, X-Total-Count: 42, ...
 ```
 
-### 5.2 身份认证
+### 5.4 路径二：旧双 Header（X-AUTH-USER / X-AUTH-TOKEN，已废弃）
+
+步骤编号 B1-B15，与 Bearer Token 在 A3 处汇合前分叉，在 A7 处汇合：
 
 ```
-5. AccessTokenHandler::getUserBadgeFrom('abc123xyz')
-   - 查询 kimai2_access_token 表
-   - 检查 token 是否有效（未过期）
-   - 更新 lastUsage（每分钟一次）
-   - 返回 UserBadge，其中包含 User 对象
+请求: GET /api/timesheets
+     X-AUTH-USER: alice
+     X-AUTH-TOKEN: secret123
 
-6. UserChecker 检查用户状态（是否启用、是否锁定等）
+B1. Symfony HTTP Kernel 接收请求
+B2. 防火墙链顺序匹配，到达 api 防火墙
+B3. ApiRequestMatcher::matches() 返回 true
+    - URL 以 /api/ 开头 ✓
+    - 有 X-AUTH-USER 和 X-AUTH-TOKEN 头 ✓
+    - 进入 api 防火墙
+B4. TokenAuthenticator::supports() 返回 true
+B5. TokenAuthenticator::authenticate()
+    - 速率限制检查（oldApiTokensLimiter）
+    - 查询用户表
+    - 人工延迟 usleep(200000-500000)
+    - 密码哈希验证
+    - 不存在的用户也执行一次哈希（防枚举）
+    - 返回 Passport，附带 ApiTokenUpgradeBadge
+B6. UserChecker 检查用户状态
+B7. TokenAuthenticator::onAuthenticationSuccess()
+    - 仅返回 null
+    - ❌ 不设置 api-token 属性 ← 关键差异
+B8. 【汇合点一】Token 存入 TokenStorage
 
-7. AccessTokenSuccessHandler::onAuthenticationSuccess()
-   - 在 Token 上设置 'api-token' => true 属性
-   
-8. TokenStorage 中存入认证后的 Token（包含 User 对象）
+────── 以下与 Bearer Token 路径 A8-A15 相同 ──────
+
+B9.  (=A8)  UserEnvironmentSubscriber 注入用户上下文
+B10. (=A9)  access_control 第一层检查
+B11. (=A10) ApiVoter 投票
+     - 检测到 token 没有 'api-token' 属性
+     - 直接返回 true（跳过 api_access 检查）
+B12. (=A11) 方法级权限检查
+B13. (=A12) 控制器业务逻辑
+B14. (=A13-A14) 视图构造 + 序列化
+B15. (=A15) 返回 JSON 响应
 ```
 
-### 5.3 用户上下文注入
+> 关键差异：B7 步不设置 `api-token` 属性，导致 B11 步 ApiVoter 直接放行，不检查 `api_access` 权限。
+
+### 5.5 路径三：已有网页登录会话（前端 AJAX 调用）
+
+步骤编号 C1-C12，在防火墙匹配阶段就与前两条路径分叉：
 
 ```
-9. UserEnvironmentSubscriber::prepareEnvironment()（KernelEvents::REQUEST, -10）
-   - 从 TokenStorage 获取 Token 和 User
-   - 设置 date_default_timezone_set($user->getTimezone())
-   - 设置 \Locale::setDefault($user->getLocale())
-   - 调用 $user->initCanSeeAllData(auth->isGranted('view_all_data'))
-   - 将用户语言存入 $this->userLocale（供子请求恢复使用）
-   - 设置 localeFormatExtensions 的语言环境
+请求: GET /api/timesheets
+     Cookie: PHPSESSID=abc123（已登录会话）
+
+C1. Symfony HTTP Kernel 接收请求
+C2. 防火墙链顺序匹配，到达 api 防火墙
+C3. ApiRequestMatcher::matches() 返回 false ← 关键分叉点
+    - URL 以 /api/ 开头 ✓
+    - 没有 Bearer 头 ✗
+    - 没有 X-AUTH-USER 头 ✗
+    - $request->hasPreviousSession() === true
+    - 有之前的会话 → 跳过 api 防火墙
+C4. 请求继续匹配 secured_area 防火墙
+C5. secured_area 从会话中恢复已认证的 Token
+    - （UsernamePasswordToken 或 RememberMeToken）
+    - ❌ 没有 api-token 属性
+C6. 【汇合点一】Token 存入 TokenStorage
+
+────── 以下与 Bearer Token 路径 A8-A15 相同 ──────
+
+C7.  (=A8)  UserEnvironmentSubscriber 注入用户上下文
+C8.  (=A9)  access_control 第一层检查
+C9.  (=A10) ApiVoter 投票
+     - 检测到 token 没有 'api-token' 属性
+     - 直接返回 true（跳过 api_access 检查）
+C10. (=A11) 方法级权限检查
+C11. (=A12-A14) 业务逻辑 + 序列化
+C12. (=A15) 返回 JSON 响应
 ```
 
-### 5.4 权限校验
+> 关键差异：C3 步直接跳过 api 防火墙，由 secured_area 通过会话恢复身份。Token 上没有 `api-token` 属性，因此 C9 步 ApiVoter 直接放行。
+
+### 5.6 两次分叉与多次汇合总览
 
 ```
-10. 控制器 #[IsGranted('API')] 注解触发 ApiVoter
-    - 检查用户类型是否为 User
-    - 检查是否处于 2FA 进行中
-    - 检测到 token 有 'api-token' 属性 → 检查 'api_access' 权限
-    - 返回 ACCESS_GRANTED
-
-11. 方法级别的 #[IsGranted('view_own_timesheet')] 进一步检查具体权限
+HTTP 请求
+   │
+   ▼
+┌─────────────────────────────────┐
+│  第一次分叉：ApiRequestMatcher  │  ← src/API/Authentication/ApiRequestMatcher.php
+└─────────┬───────────┬───────────┘
+          │           │
+   api 防火墙    secured_area 防火墙
+          │           │
+    ┌─────┴─────┐     │
+    │           │     │
+ Bearer    旧双 Header │
+ Token     (TokenAuth) │
+    │           │     │
+    ▼           ▼     ▼
+  认证成功    认证成功  会话恢复
+ 设api-token  不设      不设
+    │           │     │
+    └─────┬─────┘     │
+          │           │
+          ▼           ▼
+┌─────────────────────────────────┐
+│   汇合点一：TokenStorage         │  ← Security.token_storage
+└─────────────────┬───────────────┘
+                  │
+                  ▼
+        UserEnvironmentSubscriber  ← src/EventSubscriber/UserEnvironmentSubscriber.php
+        注入时区 / Locale / 数据可见性
+                  │
+                  ▼
+        access_control 第一层
+        IS_AUTHENTICATED_REMEMBERED
+                  │
+                  ▼
+┌─────────────────────────────────┐
+│  第二次分叉：ApiVoter            │  ← src/Voter/ApiVoter.php
+│  检查 api-token 属性决定分支      │
+└─────────┬───────────┬───────────┘
+          │           │
+   检查api_access   直接放行
+   (Bearer Token)   (旧双Header / 会话)
+          │           │
+          └─────┬─────┘
+                │
+                ▼
+        方法级业务权限检查
+                │
+                ▼
+        控制器业务逻辑
+                │
+                ▼
+        View 构造 + 序列化组
+                │
+                ▼
+        JMS Serializer 序列化
+                │
+                ▼
+        JSON 响应返回
 ```
 
-### 5.5 业务逻辑与用户上下文使用
+### 5.7 子请求 locale 恢复（三者共用机制）
+
+无论哪种身份来源，子请求的 locale 恢复机制都是相同的。步骤编号 S1-S3：
 
 ```
-12. TimesheetController::cgetAction()
-    - $this->getUser() 获取当前用户
-    - $query = new TimesheetQuery(false)
-    - $this->prepareQuery($query, $paramFetcher)
-      → $query->setCurrentUser($this->getUser())
-      → $query->setIsApiCall(true)
-    - Repository 根据 currentUser 过滤数据（权限过滤）
-    - 返回 Pagination 结果
+S1. 主请求的 prepareEnvironment() 阶段
+    - 保存用户 locale 到 $this->userLocale
+    - 设置全局 \Locale::setDefault($userLocale)
+
+S2. 子请求处理期间（如 Twig render(controller(...))）
+    - LocaleAwareListener 将 \Locale::getDefault()
+      改写为子请求 URL 中的 _locale 参数
+    - 这是 Symfony 的默认行为
+
+S3. 子请求结束（KernelEvents::FINISH_REQUEST）
+    - UserEnvironmentSubscriber::restoreLocale() 触发
+    - 检查：不是主请求 & $this->userLocale 不为空
+    - 恢复 \Locale::setDefault($this->userLocale)
+    - 恢复 localeFormatExtensions->setLocale($this->userLocale)
+    - 主请求后续处理（包括序列化）不受影响
 ```
 
-### 5.6 视图构造与序列化组选择
-
-```
-13. 构造 View 对象
-    $view = new View($data, 200);
-    $view->getContext()->setGroups(self::GROUPS_COLLECTION);
-    // 或 GROUPS_COLLECTION_FULL（当 full=1 时）
-```
-
-### 5.7 序列化与响应
-
-```
-14. ViewHandler::handle()
-    - 如果 $data 是 Pagination → 提取结果数组，设置分页 Header
-    
-15. JMS Serializer 执行序列化
-    - 根据 Groups 过滤属性
-    - 使用用户时区格式化日期（date_default_timezone 已设置）
-    - 使用用户 Locale（某些本地化处理器会用到）
-    
-16. 返回 JSON 响应
-    Content-Type: application/json
-    X-Page: 1
-    X-Total-Count: 42
-    ...
-```
-
-### 5.8 子请求恢复（如需要）
-
-```
-17. 若处理过程中派发了子请求（如 Twig render(controller(...))）
-    - LocaleAwareListener 将 \Locale::getDefault() 改写为 URL locale
-    - 子请求处理完毕 → KernelEvents::FINISH_REQUEST 触发
-    - UserEnvironmentSubscriber::restoreLocale() 执行
-    - 利用 $this->userLocale 恢复 \Locale::getDefault() 和 localeFormatExtensions
-    - 主请求后续处理不受子请求 locale 污染
-```
+> 这是一个防御性设计：API 请求中子请求场景较少见，但一旦发生（如异常页面渲染、ESI 等），locale 恢复机制能保证后续序列化和业务逻辑使用正确的用户语言。
 
 ---
 
 ## 六、关键交互点总结
 
-| 层面 | 关键组件 | 作用 | 与其他层的交互 |
-|------|----------|------|----------------|
-| 身份认证 | `AccessTokenHandler` | Bearer Token 验证 | 将 User 注入 Token → 存入 TokenStorage |
-| 身份认证 | `TokenAuthenticator` | 废弃的双 Header 验证 | 同上，附带速率限制 |
-| 身份认证 | `AccessTokenSuccessHandler` | 标记 token 来源 | 在 Token 上设 `api-token` 属性，供 ApiVoter 使用 |
-| 权限控制 | `ApiVoter` | API 访问权限 | 读取 Token 的 `api-token` 属性决定检查逻辑 |
-| 用户上下文 | `TokenStorageInterface` | 用户身份存储 | 被所有需要当前用户的地方读取 |
-| 用户上下文 | `UserEnvironmentSubscriber::prepareEnvironment()` | 注入时区/语言/权限 | 从 TokenStorage 读用户 → 设置全局环境，保存 userLocale |
-| 用户上下文 | `UserEnvironmentSubscriber::restoreLocale()` | 子请求后恢复语言环境 | 利用 prepareEnvironment 保存的 userLocale 恢复全局状态 |
-| 用户上下文 | `BaseApiController::getUser()` | 控制器内用户获取 | 从 TokenStorage 读取并类型转换 |
-| 序列化 | `JMS Serializer` | 实体转 JSON | 根据 Groups 注解输出字段，受全局时区影响 |
-| 序列化 | `ViewHandler` | 分页包装/视图处理 | 在序列化前包装分页 Header |
-| 序列化 | `ValidationFailedExceptionErrorHandler` | 错误消息本地化 | 从 Security 获取用户语言翻译错误 |
+下面按三种身份来源分别梳理身份认证、用户上下文、响应序列化三者之间的关键交互点。
+
+### 6.1 Bearer Token 路径的关键交互点
+
+| 阶段 | 关键组件 | 交互内容 | 代码位置 |
+|------|----------|----------|----------|
+| 防火墙匹配 | `ApiRequestMatcher` | 检测 Bearer header，决定进入 api 防火墙 | `src/API/Authentication/ApiRequestMatcher.php`#L34-L36 |
+| 认证 | `AccessTokenHandler` | 验证 token 有效性，更新 lastUsage | `src/API/Authentication/AccessTokenHandler.php`#L17-L45 |
+| 认证成功标记 | `AccessTokenSuccessHandler` | 在 Token 上设置 `api-token=true` 属性 | `src/API/Authentication/AccessTokenSuccessHandler.php`#L17-L24 |
+| 身份存储 | `TokenStorage` | 存入带 User 的 Token，供后续使用 | Symfony Security 组件 |
+| 上下文注入 | `UserEnvironmentSubscriber` | 从 TokenStorage 读用户，注入时区/Locale/数据可见性 | `src/EventSubscriber/UserEnvironmentSubscriber.php`#L60-L84 |
+| 权限分叉 | `ApiVoter` | 检测到 `api-token` 属性，检查 `api_access` 权限 | `src/Voter/ApiVoter.php`#L72-L73 |
+| 控制器用户获取 | `BaseApiController::getUser()` | 类型安全地获取当前用户 | `src/API/BaseApiController.php`#L28-L36 |
+| 查询上下文 | `BaseApiController::prepareQuery()` | 注入 currentUser 和 isApiCall | `src/API/BaseApiController.php`#L68-L112 |
+| 序列化 | `JMS Serializer` | 根据 Groups 输出字段，受时区/Locale 影响 | `config/packages/jms_serializer.yaml` |
+| 分页处理 | `ViewHandler` | Pagination 转数组 + 分页 Header | `src/API/ViewHandler.php`#L18-L78 |
+| 错误本地化 | `ValidationFailedExceptionErrorHandler` | 用用户语言翻译验证错误 | `src/API/Serializer/ValidationFailedExceptionErrorHandler.php`#L24-L99 |
+| 子请求恢复 | `UserEnvironmentSubscriber::restoreLocale()` | 子请求结束后恢复用户 locale | `src/EventSubscriber/UserEnvironmentSubscriber.php`#L43-L58 |
+
+### 6.2 旧双 Header 路径的关键交互点
+
+| 阶段 | 关键组件 | 交互内容 | 与 Bearer Token 的差异 |
+|------|----------|----------|----------------------|
+| 防火墙匹配 | `ApiRequestMatcher` | 检测双 Header，决定进入 api 防火墙 | 检测的 header 不同 |
+| 认证 | `TokenAuthenticator` | 验证用户名 + API 密码，速率限制 + 人工延迟 | 认证方式完全不同，含安全加固 |
+| 认证成功 | `TokenAuthenticator::onAuthenticationSuccess()` | 仅返回 null，**不设置** `api-token` 属性 | ✅ 核心差异点 |
+| 身份存储 | `TokenStorage` | 存入 Token + User | 相同（汇合点一） |
+| 上下文注入 | `UserEnvironmentSubscriber` | 注入时区/Locale/数据可见性 | 相同 |
+| 权限分叉 | `ApiVoter` | 无 `api-token` 属性 → 直接放行 | ✅ 不检查 `api_access` |
+| 后续流程 | 全部 | 业务逻辑 + 序列化 + 响应 | 完全相同 |
+
+> 注意：旧双 Header 方式虽然走 api 防火墙，但因为缺少 `api-token` 标记，在 ApiVoter 阶段获得了与已有会话相同的"豁免权"。这是历史遗留问题，迁移到 Bearer Token 后会恢复严格的权限检查。
+
+### 6.3 已有登录会话路径的关键交互点
+
+| 阶段 | 关键组件 | 交互内容 | 与 Bearer Token 的差异 |
+|------|----------|----------|----------------------|
+| 防火墙匹配 | `ApiRequestMatcher` | 检测到已有会话 → 返回 false，**跳过** api 防火墙 | ✅ 第一次分叉点 |
+| 认证 | `secured_area` 防火墙 | 从会话中恢复已认证的 Token | 不需要重新认证，会话复用 |
+| 认证成功 | 默认会话处理器 | **不设置** `api-token` 属性 | ✅ 与旧双 Header 相同 |
+| 身份存储 | `TokenStorage` | 存入 Token + User | 相同（汇合点一） |
+| 上下文注入 | `UserEnvironmentSubscriber` | 注入时区/Locale/数据可见性 | 相同 |
+| 权限分叉 | `ApiVoter` | 无 `api-token` 属性 → 直接放行 | ✅ 不检查 `api_access` |
+| 后续流程 | 全部 | 业务逻辑 + 序列化 + 响应 | 完全相同 |
+
+> 设计意图：前端页面上的 AJAX 调用本质上是页面功能的延伸，用户已经通过登录验证，不需要额外的 API 访问权限。这种设计提升了前端开发体验，但也意味着 API 的 `api_access` 权限只对外部 Bearer Token 调用有效。
+
+### 6.4 三层权限检查体系（三者共用框架）
+
+无论哪种身份来源，API 请求都经过三层权限检查：
+
+```
+第一层：access_control（security.yaml）
+  检查：IS_AUTHENTICATED_REMEMBERED
+  结果：三者都必须通过
+
+        ↓ 通过
+
+第二层：ApiVoter（#[IsGranted('API')]）
+  检查：根据身份来源走不同分支
+  ├─ Bearer Token → 检查 api_access 权限
+  ├─ 旧双 Header → 直接放行
+  └─ 已有会话 → 直接放行
+
+        ↓ 通过
+
+第三层：方法级权限（具体业务权限）
+  检查：view_own_timesheet, edit_timesheet 等
+  结果：三者都必须通过（权限内容可能不同）
+
+        ↓ 通过
+
+      执行业务逻辑
+```
 
 ---
 
 ## 七、设计亮点
 
-1. **双轨认证平滑过渡**：同时支持 Bearer Token（新）和 X-AUTH-USER（旧），通过 `ApiTokenUpgradeBadge` 支持密码哈希自动升级，给用户迁移时间。
+下面按三种身份来源的视角，分别总结 Kimai API 设计中的亮点。
 
-2. **会话复用**：前端发起的 API 请求通过 `hasPreviousSession()` 判断直接复用会话身份，不走令牌认证，减少数据库查询。
+### 7.1 Bearer Token 路径的设计亮点
 
-3. **分组驱动的序列化**：`Default` / `Entity` / `Collection` / `Expanded` / `Not_Expanded` 等组的组合，灵活应对不同视图粒度的需求。
+1. **Token 属性作为状态载体**
+   - `AccessTokenSuccessHandler` 在 Token 上设置 `api-token=true` 属性
+   - 将"认证来源"这一状态沿请求链路传递到投票器
+   - 避免了重复的头部检查或全局变量
+   - 代码位置：`src/API/Authentication/AccessTokenSuccessHandler.php`#L17-L24
 
-4. **用户上下文事件化**：通过 `KernelEvents::REQUEST` 事件注入用户环境（时区、语言），业务代码和序列化代码都能共享这个上下文，不需要层层传递。
+2. **最小化数据库写入**
+   - AccessToken 的 `lastUsage` 每分钟才更新一次
+   - 避免每次 API 请求都写数据库
+   - 在高并发场景下显著减轻数据库压力
+   - 代码位置：`src/API/Authentication/AccessTokenHandler.php`#L32-L38
 
-5. **子请求 locale 恢复**：`prepareEnvironment` 在主请求阶段保存用户 locale，`restoreLocale` 在子请求结束后恢复，防止 `LocaleAwareListener` 的 URL locale 泄漏回主请求上下文。
+3. **分层权限管控**
+   - 第一层 `access_control` 保证基本身份认证
+   - 第二层 `ApiVoter` 针对外部 API 调用额外检查 `api_access`
+   - 第三层方法级权限控制具体业务操作
+   - 每层职责清晰，安全纵深明确
 
-6. **最小化数据库写入**：AccessToken 的 `lastUsage` 每分钟才更新一次，避免每次 API 请求都写数据库。
+4. **无状态设计**
+   - `api` 防火墙设置 `stateless: true`
+   - 不创建会话，每次请求都验证令牌
+   - 适合水平扩展和第三方集成
 
-7. **安全纵深**：
-   - 速率限制防止暴力破解
-   - 人工延迟增加计时攻击难度
-   - 不存在的用户也执行哈希验证防止用户枚举
-   - ApiVoter 二次检查 API 访问权限
-   - 2FA 进行中禁止 API 访问
+### 7.2 旧双 Header 路径的设计亮点（安全加固方面）
+
+1. **速率限制**
+   - 使用 `oldApiTokensLimiter` 限制认证尝试频率
+   - 防止暴力破解 API 密码
+   - 代码位置：`src/API/Authentication/TokenAuthenticator.php`#L70-L76
+
+2. **人工延迟**
+   - `usleep(mt_rand(200000, 500000))` 增加随机延迟
+   - 增加计时攻击的难度
+   - 代码位置：`src/API/Authentication/TokenAuthenticator.php`#L109
+
+3. **防止用户枚举**
+   - 即使用户名不存在，也执行一次密码哈希验证
+   - 攻击者无法通过响应时间判断用户名是否存在
+   - 代码位置：`src/API/Authentication/TokenAuthenticator.php`#L95-L107
+
+4. **密码哈希自动升级**
+   - 使用 `ApiTokenUpgradeBadge` 支持密码哈希重新哈希
+   - 当哈希算法迭代次数增加时自动升级
+   - 代码位置：`src/API/Authentication/TokenAuthenticator.php`#L123-L131
+
+5. **平滑迁移机制**
+   - 同时支持新旧两种认证方式
+   - 标记为 `@deprecated since 2.54`，给用户迁移时间
+   - `ApiTokenMigratingListener` 监听登录成功事件辅助迁移
+
+### 7.3 已有登录会话路径的设计亮点
+
+1. **会话复用机制**
+   - `ApiRequestMatcher` 通过 `hasPreviousSession()` 判断
+   - 已登录用户的 AJAX 请求直接复用会话身份
+   - 不需要额外的令牌认证，减少数据库查询
+   - 代码位置：`src/API/Authentication/ApiRequestMatcher.php`#L45-L48
+
+2. **前端体验优化**
+   - 前端页面发起 API 调用时无感通过认证
+   - 不需要在前端代码中管理 API 令牌
+   - API 作为页面功能的自然延伸
+
+3. **差异化权限设计**
+   - 内部会话调用不需要 `api_access` 权限
+   - 外部 Bearer Token 调用需要额外权限
+   - 既保证了外部集成的安全性，又保证了内部使用的便捷性
+
+### 7.4 三者共用的设计亮点
+
+1. **两次分叉、多次汇合的架构**
+   - 第一次分叉在防火墙匹配阶段（身份来源决定处理路径）
+   - 第二次分叉在 ApiVoter 阶段（身份来源决定权限严格程度）
+   - 在 TokenStorage、用户上下文、业务逻辑、序列化处多次汇合
+   - 既保证了差异化处理，又最大化了代码复用
+
+2. **事件驱动的用户上下文注入**
+   - 通过 `KernelEvents::REQUEST` 事件注入用户环境
+   - 时区、Locale、数据可见性一次性设置到位
+   - 业务代码和序列化代码都能共享这个上下文
+   - 不需要层层传递用户对象
+
+3. **子请求 locale 恢复机制**
+   - `prepareEnvironment` 保存用户 locale
+   - `restoreLocale` 在子请求结束后恢复
+   - 防止 Symfony `LocaleAwareListener` 的 URL locale 泄漏
+   - 防御性设计，保证序列化和业务逻辑使用正确的语言
+
+4. **分组驱动的序列化策略**
+   - `Default` / `Entity` / `Collection` / `Expanded` / `Not_Expanded` 多组组合
+   - 灵活应对不同视图粒度的需求
+   - 通过 `full=1` 参数控制展开程度
+   - 客户端可以按需获取数据，减少传输量
+
+5. **安全纵深防御**
+   - 防火墙层：认证 + 速率限制 + 人工延迟
+   - 权限层：三层权限检查体系
+   - 业务层：Repository 根据 currentUser 过滤数据
+   - 会话层：2FA 进行中禁止 API 访问
+   - 全方位保障 API 安全
