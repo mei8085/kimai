@@ -1,6 +1,6 @@
 # Kimai API 身份认证、用户上下文与响应序列化协作机制
 
-本文档梳理 Kimai 外部 REST API 在**身份认证过滤器**、**用户上下文注入**、**响应序列化**三块的协作方式，从代码层面解析三者如何串联成一条完整的请求-响应链路。
+本文档梳理 Kimai 外部 REST API 在**身份认证过滤器**、**用户上下文注入**、**响应序列化**三块的协作方式，从代码层面解析三者如何串联成一条完整的请求-响应链路。文档按三种身份来源（Bearer Token、旧双 Header、已有登录会话）组织内容。
 
 ---
 
@@ -266,6 +266,160 @@ if (
 - **已有会话**：面向前端 UI，API 是页面功能的自然延伸，登录本身已足够验证身份
 
 > 安全提示：如果希望旧双 Header 方式也检查 `api_access`，可以在 `TokenAuthenticator::onAuthenticationSuccess()` 中添加 `$token->setAttribute('api-token', true)`。但更推荐的做法是尽快完全迁移到 Bearer Token 方式。
+
+
+### 2.8 2FA 与 Remember-Me 边界
+
+API 权限链路上的 2FA（双因素认证）和 remember-me（记住我）边界是容易混淆的点。下面分别从代码层面解析三种身份来源在这两个边界上的行为差异。
+
+#### 2.8.1 2FA 边界：/api 路径不触发 2FA，但 TwoFactorToken 会被拦
+
+**核心结论**：API 请求本身不会触发 2FA 流程，但如果用户正处于 2FA 进行中状态（持有 `TwoFactorToken`），则会被 `ApiVoter` 拦住。
+
+##### 2.8.1.1 为什么 /api 不触发 2FA
+
+Kimai 使用 SchebTwoFactorBundle 实现 2FA，触发条件由 `src/Security/TwoFactorCondition.php`#L22-L32 控制：
+
+```php
+public function shouldPerformTwoFactorAuthentication(AuthenticationContextInterface $context): bool
+{
+    // never require 2FA on API calls
+    if (str_starts_with($context->getRequest()->getRequestUri(), '/api/')) {
+        return false;
+    }
+
+    // if a user is remembered, it means he already passed the TOTP code
+    // do not bother again with the code
+    return !$this->authorizationChecker->isGranted('IS_AUTHENTICATED_REMEMBERED');
+}
+```
+
+两个判断条件：
+1. **路径判断**：URL 以 `/api/` 开头 → 直接返回 `false`，不触发 2FA
+2. **记住我判断**：已通过 remember-me 认证的用户 → 不重复触发 2FA
+
+> 这个设计很关键：API 是面向外部集成的，2FA 的交互式表单流程不适合 API 调用场景，所以直接在入口处排除。
+
+##### 2.8.1.2 哪些身份来源可能遇到 2FA
+
+| 身份来源 | 所属防火墙 | 防火墙是否配置 two_factor | 是否可能触发 2FA |
+|----------|-----------|-------------------------|-----------------|
+| **Bearer Token** | `api` | ❌ 未配置 | ❌ 不可能 |
+| **旧双 Header** | `api` | ❌ 未配置 | ❌ 不可能 |
+| **已有登录会话** | `secured_area` | ✅ 已配置 | ⚠️ 可能，但路径判断会拦住 |
+
+详细说明：
+- **Bearer Token / 旧双 Header**：`api` 防火墙的 `security.yaml`#L20-L31 配置中根本没有 `two_factor` 节点，2FA 监听器不会挂载到这个防火墙上，所以完全不可能触发 2FA。
+- **已有登录会话**：`secured_area` 防火墙配置了 `two_factor`（`security.yaml`#L60-L63），但 `TwoFactorCondition` 的路径判断会让 `/api/` 请求直接跳过 2FA 流程。
+
+##### 2.8.1.3 ApiVoter 中的 TwoFactorToken 拦截
+
+虽然 API 请求不触发 2FA，但 `ApiVoter` 仍然做了防御性检查。`src/Voter/ApiVoter.php`#L64-L69：
+
+```php
+if (
+    $token instanceof TwoFactorTokenInterface ||
+    $this->authorizationChecker->isGranted('IS_AUTHENTICATED_2FA_IN_PROGRESS', $user)
+) {
+    return false;
+}
+```
+
+双重检查：
+1. **`instanceof TwoFactorTokenInterface`**：直接检查 Token 类型，性能更好
+2. **`IS_AUTHENTICATED_2FA_IN_PROGRESS`**：通过授权检查器判断，更通用
+
+> 代码注释（第60-62行）解释了为什么保留 `instanceof` 检查：虽然官方文档推荐用属性检查，但直接 `instanceof` 稍微快一点，作为纵深防御保留。
+
+##### 2.8.1.4 什么情况下已有会话会遇到 TwoFactorToken
+
+虽然 `/api/` 路径不触发 2FA，但以下场景可能出现 `TwoFactorToken` 访问 API 的情况：
+1. 用户登录了账号（第一因子通过），正停留在 2FA 输入页面
+2. 此时浏览器发起了 API 请求（如定时轮询、自动保存等）
+3. 请求携带会话 Cookie，Token 处于 `TwoFactorToken` 状态
+4. `ApiVoter` 检测到后返回 `false`，拒绝 API 访问
+
+这种设计保证了：2FA 未完成的用户不能通过会话间接访问 API 数据。
+
+#### 2.8.2 Remember-Me 边界：remember-me 会话可访问 API
+
+**核心结论**：API 的 `access_control` 只要求 `IS_AUTHENTICATED_REMEMBERED`，remember-me（记住我）会话可以正常访问 API。`ApiVoter` 特意没有加入 `IS_AUTHENTICATED_FULLY` 检查。
+
+##### 2.8.2.1 三种身份来源的 remember-me 支持
+
+| 身份来源 | 所属防火墙 | remember_me 配置 | 支持 remember-me | Token 认证级别 |
+|----------|-----------|-----------------|-----------------|--------------|
+| **Bearer Token** | `api` | `remember_me: false` | ❌ 不支持 | IS_AUTHENTICATED_FULLY |
+| **旧双 Header** | `api` | `remember_me: false` | ❌ 不支持 | IS_AUTHENTICATED_FULLY |
+| **已有登录会话** | `secured_area` | 完整配置（7天） | ✅ 支持 | IS_AUTHENTICATED_REMEMBERED 或 FULLY |
+
+**api 防火墙的 remember_me: false**
+
+`config/packages/security.yaml`#L20-L31 中 `api` 防火墙有两处显式禁用 remember-me：
+```yaml
+api:
+    access_token:
+        remember_me: false        # access_token 认证器不使用记住我
+    stateless: true
+    remember_me: false           # 整个防火墙级别禁用记住我
+```
+
+原因：API 是无状态的，每次请求都携带令牌认证，不需要也不应该使用 remember-me cookie。
+
+##### 2.8.2.2 access_control 只要求 IS_AUTHENTICATED_REMEMBERED
+
+`config/packages/security.yaml`#L102：
+```yaml
+- {path: '^/api', roles: IS_AUTHENTICATED_REMEMBERED}
+```
+
+这意味着：
+- ✅ `IS_AUTHENTICATED_FULLY`（完整登录）可以访问
+- ✅ `IS_AUTHENTICATED_REMEMBERED`（记住我登录）可以访问
+- ❌ `IS_AUTHENTICATED_ANONYMOUSLY`（匿名）不能访问
+
+##### 2.8.2.3 ApiVoter 为什么不检查 IS_AUTHENTICATED_FULLY
+
+`src/Voter/ApiVoter.php`#L56-L58 有一段被注释掉的代码：
+
+```php
+// this check does not work, because remember_me sessions would not pass this check
+// as the frontend uses the API, the user need to be able to use the API via session, even if not "fully authenticated"
+// !$this->authorizationChecker->isGranted('IS_AUTHENTICATED_FULLY', $user)
+```
+
+**设计原因**：
+- 前端页面大量使用 AJAX 调用 API
+- 如果要求 `IS_AUTHENTICATED_FULLY`，remember-me 用户在使用前端时会遇到 API 403 错误
+- 体验很差，因为用户明明能看到页面，但数据加载不出来
+- 所以特意放行 remember-me 会话的 API 访问
+
+> **安全权衡**：remember-me 会话的安全性低于完整登录（用户没有重新输入密码）。但前端页面本身就对 remember-me 用户开放，API 作为页面功能的延伸，保持一致的安全级别是合理的。
+
+##### 2.8.2.4 TwoFactorCondition 中的 remember-me 豁免
+
+`src/Security/TwoFactorCondition.php`#L29-L31 中 remember-me 用户也跳过 2FA：
+
+```php
+// if a user is remembered, it means he already passed the TOTP code
+// do not bother again with the code
+return !$this->authorizationChecker->isGranted('IS_AUTHENTICATED_REMEMBERED');
+```
+
+逻辑：remember-me cookie 是在用户之前完整登录（并通过 2FA）后颁发的，所以认为 remember-me 会话已经隐含了 2FA 通过的事实。
+
+#### 2.8.3 2FA / Remember-Me 边界总表
+
+| 检查点 | Bearer Token | 旧双 Header | 已有会话（完整登录） | 已有会话（remember-me） |
+|--------|-------------|-----------|-------------------|----------------------|
+| 触发 2FA 流程 | ❌ 不可能（防火墙未配置） | ❌ 不可能（防火墙未配置） | ❌ 不触发（路径排除） | ❌ 不触发（路径排除 + remember-me 豁免） |
+| TwoFactorToken 被 ApiVoter 拦 | ❌ 不会遇到 | ❌ 不会遇到 | ⚠️ 可能（2FA 未完成时） | ❌ 不会遇到 |
+| 通过 access_control（REMEMBERED） | ✅ 是 | ✅ 是 | ✅ 是 | ✅ 是 |
+| 通过 ApiVoter 2FA 检查 | ✅ 是 | ✅ 是 | ✅ 是（2FA 完成后） | ✅ 是 |
+| 是否支持 remember-me | ❌ 不支持 | ❌ 不支持 | — | ✅ 支持 |
+| 访问 API 的最低认证级别 | FULLY | FULLY | FULLY 或 REMEMBERED | REMEMBERED |
+
+> **一句话总结**：API 链路对 2FA 的策略是「不主动触发，但遇到了就拦」；对 remember-me 的策略是「完全放行，与前端页面保持一致」。
 
 ---
 
