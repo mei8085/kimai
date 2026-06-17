@@ -1144,13 +1144,17 @@ protected function getFileResponse(mixed $file, string $filename): BinaryFileRes
 步骤 4.1: 保存发票文件到磁盘 (L345)
   └─ $invoiceFilename = $this->saveGeneratedInvoice($event)
      ├─ 获取 var/data/invoices/ 目录
-     ├─ 从响应 Content-Disposition 头提取文件名
-     │  ├─ 有则使用
-     │  └─ 无则从 Content-Type 推断扩展名
-     ├─ 文件名长度校验（≤ 150 字符）
-     ├─ 检查是否重名
+     ├─ 【初始文件名】基于 InvoiceFilename 生成 (L194)
+     │  └─ new InvoiceFilename($event->getModel())
+     ├─ 从响应头提取最终文件名 (L198-L218)
+     │  ├─ 优先：Content-Disposition 中的 filename= (L198-L209)
+     │  │  └─ 有则覆盖初始文件名
+     │  └─ 次之：Content-Type 推断扩展名 (L211-L218)
+     │     └─ 无 Content-Disposition 时，追加扩展名
+     ├─ 文件名长度校验（≤ 150 字符）(L221-L223)
+     ├─ 检查是否重名 (L225-L227)
      │  └─ 已存在则抛异常
-     └─ 保存文件
+     └─ 保存文件 (L229-L234)
         ├─ BinaryFileResponse: move 临时文件
         └─ 其他: file_put_contents 写入内容
 
@@ -1168,21 +1172,26 @@ protected function getFileResponse(mixed $file, string $filename): BinaryFileRes
   │  └─ setVat($template->getVat())
   └─ $invoice->setFilename($invoiceFilename)
 
-步骤 4.3: 保存客户默认模板（可选）(L351-L353)
-  └─ 若客户无默认模板，设置之
+步骤 4.3: 保存客户默认模板【第二处】（可选）(L351-L353)
+  └─ if (!$invoice->getCustomer()->hasInvoiceTemplate())
+     └─ $invoice->getCustomer()->setInvoiceTemplate($model->getTemplate())
+  【注意：此处仅更新实体属性，实际持久化由下一步 saveInvoice 级联完成】
+  【与步骤7的区别：步骤7在控制器中主动调用 CustomerRepository::saveCustomer 持久化】
 
 步骤 4.4: 保存 Invoice 实体到数据库 (L354)
   └─ $this->saveInvoice($invoice)
      ├─ InvoiceUpdatePreEvent 分发
      ├─ InvoiceRepository::saveInvoice()
      │  └─ EntityManager::persist() + flush()
+     │     └─ 【级联保存】Customer 的 InvoiceTemplate 变更随 flush 持久化
      └─ InvoiceUpdatePostEvent 分发
 
 步骤 4.5: 标记工时为已导出 (L356)
   └─ $this->markEntriesAsExported($model->getEntries())
      └─ 遍历所有 InvoiceItemRepositoryInterface
-        └─ $repository->setExported($entries)
-           └─ TimesheetRepository::setExported()
+        └─ TimesheetInvoiceItemRepository::setExported($entries)
+           ├─ 过滤 instanceof Timesheet（仅处理 Timesheet 类型条目）
+           └─ TimesheetRepository::setExported($timesheets)
 
 步骤 4.6: 分发发票创建事件 (L357)
   └─ InvoiceCreatedEvent
@@ -1218,56 +1227,121 @@ protected function getFileResponse(mixed $file, string $filename): BinaryFileRes
 
 ```
 1. HTTP GET /invoice/save-invoice/{customer}/{token}
+   路由名: invoice_create  方法: GET
    ↓
 2. InvoiceController::createInvoiceAction()
-   ├─ 创建 InvoiceQuery，绑定表单参数
-   └─ InvoiceService::createInvoice($model, $dispatcher)
-      ├─ InvoiceService::createModel($query)
-      │  ├─ 从 InvoiceTemplate 获取 calculator / numberGenerator
-      │  ├─ InvoiceModelFactory 创建 InvoiceModel
-      │  ├─ 注入所有 Hydrator
-      │  └─ InvoiceService::getInvoiceItems() → TimesheetInvoiceItemRepository
-      │     └→ TimesheetRepository::getTimesheetResult() → ExportableItem[]
+   ├─ 步骤1: CSRF Token 校验 (invoice.create)
+   ├─ 步骤2-3: InvoiceQuery 构建 + 关闭模板覆盖
+   ├─ 步骤4: 表单创建与 handleSearch 处理
+   ├─ 步骤5: 表单校验 + $query->setCustomers([$customer])
+   ├─ 步骤6: InvoiceService::createModel($query)
+   │  ├─ createModelWithoutEntries()
+   │  │  ├─ 确定客户 + 模板（允许客户模板覆盖时替换）
+   │  │  ├─ 创建 DefaultInvoiceFormatter（模板语言）
+   │  │  ├─ InvoiceModelFactory::createModel()
+   │  │  │  ├─ new InvoiceModel(...)
+   │  │  │  ├─ 注入所有 InvoiceModelHydrator（TaggedIterator）
+   │  │  │  ├─ 注入所有 InvoiceItemHydrator（TaggedIterator）
+   │  │  │  └─ $model->setQuery($query)
+   │  │  ├─ setInvoiceDate + setUser
+   │  │  ├─ 获取并设置 NumberGenerator
+   │  │  │  └─ $generator->setModel($model) 双向绑定
+   │  │  └─ 获取并设置 Calculator
+   │  │     └─ $calculator->setModel($model) 双向绑定
+   │  ├─ addEntries(getInvoiceItems($query))
+   │  │  └─ 遍历 InvoiceItemRepositoryInterface → ExportableItem[]
+   │  └─ prepareModelQueryDates() → 从条目推断起止日期
+   │
+   ├─ 步骤7: 【第一处】保存客户默认模板（CustomerRepository::saveCustomer）
+   │  └─ if ($customer->getInvoiceTemplate() === null)
+   │
+   └─ 步骤8: InvoiceService::createInvoice($model, $dispatcher)
       │
-      ├─ InvoicePreRenderEvent 分发
-      ├─ 发票号查重
-      ├─ 选择渲染器（基于模板文件扩展名）
+      ├─ 第三阶段：发票渲染与文件生成
+      │  ├─ 步骤3.1: 查找 InvoiceDocument（模板文件）
+      │  ├─ 步骤3.2: 遍历 Renderer，通过 supports() 匹配
+      │  ├─ 步骤3.3: InvoicePreRenderEvent（可停止传播跳过）
+      │  ├─ 步骤3.4: 发票号查重
+      │  │  └─ $model->getInvoiceNumber()【首次触发生成】
+      │  │     └─ $generator->getInvoiceNumber() 惰性计算
+      │  ├─ 步骤3.5: $renderer->render($document, $model) → Response
+      │  │  │
+      │  │  ├─ [PDF 路径] PdfRenderer::render()
+      │  │  │  ├─ InvoiceFilename 生成（基于已生成的发票号）
+      │  │  │  ├─ AbstractTwigRenderer::renderTwigTemplate()
+      │  │  │  │  ├─ $model->toArray() → 合并所有 ModelHydrator 结果
+      │  │  │  │  ├─ 每个 InvoiceItem → itemToArray()
+      │  │  │  │  ├─ 切换翻译语言和格式化 locale
+      │  │  │  │  ├─ 启用 Twig 沙箱
+      │  │  │  │  └─ Twig 渲染模板
+      │  │  │  ├─ HtmlToPdfConverter::convertToPdf()
+      │  │  │  └─ createPdfResponse() → Response 对象
+      │  │  │
+      │  │  └─ [XLSX 路径] XlsxRenderer::render()
+      │  │     ├─ IOFactory::load() 加载 Excel 模板
+      │  │     ├─ InvoiceModel::toArray() → 模型级替换变量
+      │  │     ├─ addTemplateRows() 扩展数据行（复制首行格式）
+      │  │     ├─ 遍历单元格，替换 ${变量名} 占位符
+      │  │     ├─ saveSpreadsheet() → 临时文件
+      │  │     └─ getFileResponse() → BinaryFileResponse
+      │  │
+      │  └─ 步骤3.6: InvoicePostRenderEvent（含 Response）
       │
-      ├─ [PDF 路径] PdfRenderer::render()
-      │  ├─ AbstractTwigRenderer::renderTwigTemplate()
-      │  │  ├─ InvoiceModel::toArray() → 模型级变量
-      │  │  │  └─ 遍历所有 InvoiceModelHydrator，合并结果
-      │  │  ├─ InvoiceItem[] → 条目级变量数组
-      │  │  │  └─ 遍历所有 InvoiceItemHydrator，合并结果
-      │  │  ├─ 切换翻译语言和格式化 locale
-      │  │  ├─ 启用 Twig 沙箱
-      │  │  └─ Twig 渲染模板
-      │  ├─ HtmlToPdfConverter::convertToPdf()
-      │  └─ createPdfResponse() → Response
+      ├─ 第四阶段：文件保存与实体持久化
+      │  ├─ 步骤4.1: saveGeneratedInvoice() → 保存到 var/data/invoices/
+      │  │  ├─ 初始文件名: new InvoiceFilename($model)
+      │  │  ├─ 从 Content-Disposition 头或 Content-Type 确定最终文件名
+      │  │  ├─ 文件名长度 + 重名校验
+      │  │  └─ BinaryFileResponse 用 move()，其他用 file_put_contents()
+      │  ├─ 步骤4.2: new Invoice() + setModel() + setFilename()
+      │  │  └─ 从 Calculator 提取 total/tax，从模板提取 dueDays/vat
+      │  ├─ 步骤4.3: 【第二处】设置客户默认模板
+      │  │  └─ if (!$customer->hasInvoiceTemplate()) → setInvoiceTemplate()
+      │  │     【仅更新实体属性，未单独 flush】
+      │  ├─ 步骤4.4: saveInvoice($invoice)
+      │  │  ├─ InvoiceUpdatePreEvent
+      │  │  ├─ EntityManager::persist() + flush()
+      │  │  │  └─ 级联持久化 Customer 的 InvoiceTemplate 变更
+      │  │  └─ InvoiceUpdatePostEvent
+      │  ├─ 步骤4.5: markEntriesAsExported() → 标记工时为已导出
+      │  │  └─ 遍历 InvoiceItemRepositoryInterface::setExported()
+      │  └─ 步骤4.6: InvoiceCreatedEvent 分发
       │
-      ├─ [XLSX 路径] XlsxRenderer::render()
-      │  ├─ IOFactory::load() 加载模板文件
-      │  ├─ InvoiceModel::toArray() → 模型级替换变量
-      │  ├─ addTemplateRows() 扩展数据行
-      │  ├─ 遍历所有单元格，替换 ${...} 占位符
-      │  ├─ saveSpreadsheet() → 临时文件
-      │  └─ getFileResponse() → BinaryFileResponse
-      │
-      ├─ InvoicePostRenderEvent 分发
-      ├─ saveGeneratedInvoice()
-      │  └─ 文件保存到 var/data/invoices/
-      ├─ 创建 Invoice 实体并入库
-      ├─ markEntriesAsExported() → 标记工时为已导出
-      └─ InvoiceCreatedEvent 分发
+      └─ 返回 Invoice 实体
    ↓
-3. 重定向到发票列表页
+3. 步骤9: 重定向到发票列表（携带新发票ID高亮）
+   redirectToRoute('admin_invoice_list', ['id' => $invoice->getId()])
 
 4. （后续）HTTP GET /invoice/download/{id}
+   路由名: admin_invoice_download  权限: view_invoice
    ↓
 5. InvoiceController::downloadAction()
-   ├─ InvoiceService::getInvoiceFile() → var/data/invoices/ 下的文件
-   └─ $this->file() → BinaryFileResponse
+   ├─ ParamConverter 自动加载 Invoice 实体
+   ├─ InvoiceService::getInvoiceFile($invoice)
+   │  ├─ 拼接 var/data/invoices/ + $invoice->getInvoiceFilename()
+   │  └─ is_file() + is_readable() → SplFileInfo or null
+   └─ $this->file($realPath, $basename) → BinaryFileResponse
 ```
+
+---
+
+### 2.8 四处描述一致性核对总表
+
+下表确保**建模、生成文件、保存实体、下载读取**四步在 2.6 时序和 2.7 调用链中的描述完全一致：
+
+| 核对项 | 2.6 时序 | 2.7 调用链 | 代码依据 | 状态 |
+|-------|---------|-----------|---------|------|
+| **建模：客户模板第一处保存** | 步骤7：控制器中调用 `CustomerRepository::saveCustomer` | 步骤7：明确标注第一处保存，用 CustomerRepository | [InvoiceController.php#L196-L199](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Controller/InvoiceController.php#L196-L199) | ✅ 一致 |
+| **建模：Hydrator 注入方式** | 步骤2.1：通过 TaggedIterator 注入 | Factory 层：TaggedIterator 明确标注 | [InvoiceModelFactory.php#L26-L29](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/InvoiceModelFactory.php#L26-L29) | ✅ 一致 |
+| **建模：Calculator/Generator 双向绑定** | 步骤2.1：`setModel($model)` 双向绑定 | Factory 层：`$generator->setModel($model)` 标注 | [InvoiceService.php#L439-L440](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/InvoiceService.php#L439-L440) | ✅ 一致 |
+| **建模：发票号生成时机** | 步骤3.4：查重时惰性生成 | 步骤3.4：【首次触发生成】标注 | [InvoiceModel.php#L187-L198](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/InvoiceModel.php#L187-L198) | ✅ 一致 |
+| **生成文件：文件名确定顺序** | 步骤4.1：InvoiceFilename → Content-Disposition → Content-Type | 步骤4.1：三级优先级完全一致 | [InvoiceService.php#L194-L218](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/InvoiceService.php#L194-L218) | ✅ 一致 |
+| **保存实体：客户模板第二处设置** | 步骤4.3：仅更新实体，级联持久化 | 步骤4.3：【第二处】明确区别于第一处 + 级联说明 | [InvoiceService.php#L351-L354](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/InvoiceService.php#L351-L354) | ✅ 一致 |
+| **保存实体：markEntries 顺序** | 步骤4.5：saveInvoice 之后执行 | 步骤4.5：完全一致顺序 | [InvoiceService.php#L354-L356](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Invoice/InvoiceService.php#L354-L356) | ✅ 一致 |
+| **保存实体：事件分发** | 4 个事件（PreRender/PostRender/UpdatePre,Post/Created） | 4 个事件位置完全一致 | InvoiceService.php 各对应行 | ✅ 一致 |
+| **下载：路由和权限** | 路由 `/download/{id}`，权限 `view_invoice` | 路由名 `admin_invoice_download`，权限一致 | [InvoiceController.php#L299-L301](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Controller/InvoiceController.php#L299-L301) | ✅ 一致 |
+| **下载：响应方式** | `$this->file()` 返回 BinaryFileResponse | 调用链完全一致 | [InvoiceController.php#L311](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Controller/InvoiceController.php#L311) | ✅ 一致 |
+| **整体：重定向参数** | `redirectToRoute('admin_invoice_list', ['id' => ...])` | 携带 id 参数，用于高亮 | [InvoiceController.php#L205](file:///d:/fz/0601-2/solo-dogfeeding/code/17-kimai/src/Controller/InvoiceController.php#L205) | ✅ 一致 |
 
 ---
 
