@@ -128,7 +128,7 @@ public function onAuthenticationSuccess(Request $request, TokenInterface $token)
 
 ### 2.6 API 权限投票器（ApiVoter）
 
-`src/Voter/ApiVoter.php`#L24-L78 是 API 访问权限的核心守卫，控制器上的 `#[IsGranted('API')]` 最终由它处理：
+`src/Voter/ApiVoter.php`#L24-L78 是 API 访问权限的核心守卫。API 控制器上的 `#[IsGranted('API')]` 注解（如 `src/API/TimesheetController.php`#L46）最终由它处理。
 
 ```php
 protected function voteOnAttribute(string $attribute, mixed $subject, TokenInterface $token): bool
@@ -155,7 +155,101 @@ protected function voteOnAttribute(string $attribute, mixed $subject, TokenInter
 }
 ```
 
-> 注意：会话认证的用户不需要 `api_access` 权限。这是因为前端页面本身就需要登录，API 只是页面功能的延伸。
+> 注意：权限校验分两层。第一层是 `config/packages/security.yaml`#L102 的 `access_control` 规则 `{path: '^/api', roles: IS_AUTHENTICATED_REMEMBERED}`，三种身份来源都必须通过这一关。第二层是 `#[IsGranted('API')]` 触发的 `ApiVoter`，这一层因身份来源而异。
+
+### 2.7 三种身份来源的权限校验差异
+
+API 请求的身份来源有三种，它们在进入 `ApiVoter` 后的分支走向不同，核心差异在于 Token 是否带有 `api-token` 属性。
+
+#### 差异总览表
+
+| 身份来源 | 处理防火墙 | 认证器 | 认证成功处理器 | Token 上的 `api-token` 属性 | ApiVoter 分支 | 是否检查 `api_access` |
+|----------|-----------|--------|---------------|-----------------------------|---------------|----------------------|
+| **Bearer Token** | `api` | `access_token` 内置认证器 | `AccessTokenSuccessHandler` | **设置**（`true`） | 进入检查分支 | **是** |
+| **旧双 Header** | `api` | `TokenAuthenticator` | `TokenAuthenticator::onAuthenticationSuccess()` | **未设置** | 跳过检查分支 | **否** |
+| **已有登录会话** | `secured_area` | form_login / remember_me | 默认会话处理器 | **未设置** | 跳过检查分支 | **否** |
+
+#### 2.7.1 Bearer Token（新推荐方式）
+
+**处理路径**：
+1. `src/API/Authentication/ApiRequestMatcher.php`#L34-L36 检测到 `Authorization: Bearer ...`，返回 `true`，进入 `api` 防火墙
+2. Symfony 内置的 `AccessTokenAuthenticator` 调用 `AccessTokenHandler::getUserBadgeFrom()` 验证 token
+3. 认证成功后，`src/API/Authentication/AccessTokenSuccessHandler.php`#L17-L24 的 `onAuthenticationSuccess()` 被调用，执行：
+   ```php
+   $token->setAttribute('api-token', true);
+   ```
+4. Token 存入 `TokenStorage`
+5. 控制器 `#[IsGranted('API')]` 触发 `ApiVoter`
+6. `src/Voter/ApiVoter.php`#L72-L73 检测到 `api-token` 属性，检查 `api_access` 权限：
+   ```php
+   if ($token->hasAttribute('api-token')) {
+       return $this->permissionManager->hasRolePermission($user, 'api_access');
+   }
+   ```
+
+**关键**：Bearer Token 方式的用户必须同时拥有 `IS_AUTHENTICATED_REMEMBERED` 和 `api_access` 权限才能访问 API。
+
+#### 2.7.2 旧双 Header（X-AUTH-USER / X-AUTH-TOKEN，已废弃）
+
+**处理路径**：
+1. `src/API/Authentication/ApiRequestMatcher.php`#L39-L41 检测到 `X-AUTH-USER` + `X-AUTH-TOKEN` 头，返回 `true`，进入 `api` 防火墙
+2. `src/API/Authentication/TokenAuthenticator.php`#L48-L61 的 `supports()` 检测到两个 header，返回 `true`
+3. `authenticate()` 验证用户和 API 密码，返回 `Passport`
+4. 认证成功后，`src/API/Authentication/TokenAuthenticator.php`#L143-L146 的 `onAuthenticationSuccess()` 只返回 `null`：
+   ```php
+   public function onAuthenticationSuccess(Request $request, TokenInterface $token, string $firewallName): ?Response
+   {
+       return null;
+   }
+   ```
+   **没有**在 Token 上设置 `api-token` 属性
+5. Token 存入 `TokenStorage`
+6. 控制器 `#[IsGranted('API')]` 触发 `ApiVoter`
+7. `src/Voter/ApiVoter.php`#L76 因为没有 `api-token` 属性，直接返回 `true`：
+   ```php
+   return true;
+   ```
+
+**关键**：旧双 Header 方式的用户只需 `IS_AUTHENTICATED_REMEMBERED` 即可通过，**不检查** `api_access` 权限。这是因为 `TokenAuthenticator` 已标记为 `@deprecated since 2.54`，没有与新的 `api_access` 权限机制对齐。
+
+#### 2.7.3 已有网页登录会话（前端 AJAX 调用）
+
+**处理路径**：
+1. `src/API/Authentication/ApiRequestMatcher.php`#L45-L48 检测到 `$request->hasPreviousSession()` 返回 `true`（请求携带有效的会话 Cookie），返回 `false`，**跳过** `api` 防火墙
+2. 请求继续进入 `secured_area` 防火墙（`config/packages/security.yaml`#L33-L68）
+3. `secured_area` 防火墙从会话中读取已认证的 Token，直接认证通过
+4. 该 Token 是 `UsernamePasswordToken` 或 `RememberMeToken`，**没有** `api-token` 属性
+5. 控制器 `#[IsGranted('API')]` 触发 `ApiVoter`
+6. `src/Voter/ApiVoter.php`#L76 因为没有 `api-token` 属性，直接返回 `true`：
+   ```php
+   return true;
+   ```
+
+**关键**：已登录用户在前端页面发起的 AJAX API 调用，只需 `IS_AUTHENTICATED_REMEMBERED` 即可通过，**不检查** `api_access` 权限。这是设计使然——前端页面本身已通过登录验证，API 只是页面功能的延伸，不需要额外的 API 访问权限。
+
+#### 2.7.4 2FA 双因素认证检查（三者共用）
+
+无论哪种身份来源，`src/Voter/ApiVoter.php`#L64-L69 都会先检查 2FA 状态：
+
+```php
+if (
+    $token instanceof TwoFactorTokenInterface ||
+    $this->authorizationChecker->isGranted('IS_AUTHENTICATED_2FA_IN_PROGRESS', $user)
+) {
+    return false;
+}
+```
+
+2FA 进行中的用户无法访问 API，这是三者共用的安全检查。
+
+#### 2.7.5 设计意图分析
+
+这种差异化设计的意图：
+- **Bearer Token**：面向外部集成，需要明确的 `api_access` 权限管控，防止 API 密钥被滥用
+- **旧双 Header**：已废弃，不再适配新的权限模型，用户应尽快迁移到 Bearer Token
+- **已有会话**：面向前端 UI，API 是页面功能的自然延伸，登录本身已足够验证身份
+
+> 安全提示：如果希望旧双 Header 方式也检查 `api_access`，可以在 `TokenAuthenticator::onAuthenticationSuccess()` 中添加 `$token->setAttribute('api-token', true)`。但更推荐的做法是尽快完全迁移到 Bearer Token 方式。
 
 ---
 
