@@ -14,6 +14,7 @@ LDAP 功能由 `src/Ldap/` 目录下的一组类协作完成，核心参与方�
 | [LdapConfiguration](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Configuration/LdapConfiguration.php) | 从 `SystemConfiguration` 读取 `ldap.*` 配置节 |
 | [KimaiUserProvider](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Security/KimaiUserProvider.php) | Chain Provider，串联内部数据库 provider 与 LDAP provider |
 | [FormLoginLdapFactory](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/FormLoginLdapFactory.php) | 安全工厂，注册 `LdapAuthenticator` 和 `LdapCredentialsSubscriber` 到防火墙 |
+| [LastLoginSubscriber](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/EventSubscriber/LastLoginSubscriber.php) | 监听 `LoginSuccessEvent`，设置 lastLogin 时间并持久化 User 到数据库 |
 
 ---
 
@@ -108,6 +109,89 @@ CheckPassportEvent 触发
 ```
 
 **关键设计**：LDAP 绑定失败时不直接拒绝，而是对内部用户降级到本地密码校验，允许同一个账户同时拥有本地密码和 LDAP 认证。
+
+### 3.3.1 绑定身份时登录名与目录 DN 的区分
+
+注意 `LdapCredentialsSubscriber::onCheckPassport()` [L64](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapCredentialsSubscriber.php#L64-L64) 的调用：
+
+```php
+$this->ldapManager->bind($user->getUserIdentifier(), $presentedPassword)
+```
+
+此处传入的第一个参数是 **登录名**（即用户在表单中输入的用户名），而不是目录 DN。`LdapManager::bind()` 的方法签名参数名为 `$dn`，这是命名上的误导。
+
+实际的 DN 解析流程由 Laminas\Ldap 底层完成，依赖两个关键配置：
+
+| 配置项 | 默认值 | 作用 |
+|---|---|---|
+| `ldap.connection.bindRequiresDn` | `true` | 是否需要先将登录名解析为 DN 再绑定 |
+| `ldap.connection.accountFilterFormat` | 自动生成 | 用于将登录名转换为 DN 的 LDAP 过滤器 |
+
+`accountFilterFormat` 在 [AppExtension::load() L64-L69](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/DependencyInjection/AppExtension.php#L64-L69) 中自动推导生成：
+
+```
+若 accountFilterFormat 为空且 bindRequiresDn=true：
+  accountFilterFormat = "(&" + ldap.user.filter + "(" + ldap.user.usernameAttribute + "=%s))"
+  例如：(&(&(objectClass=inetOrgPerson))(uid=%s))
+```
+
+**完整绑定流程**：
+
+```
+1. 调用 LdapManager::bind(loginName, password)
+2. → LdapDriver::bind(loginName, password)
+3. → Laminas\Ldap\Ldap::bind(loginName, password)
+   ├─ 若 bindRequiresDn=true：
+   │   a. 用 accountFilterFormat 替换 %s 为 loginName
+   │   b. 执行搜索找到用户条目
+   │   c. 取条目['dn'] 作为真实绑定 DN
+   │   d. 用真实 DN + password 执行绑定
+   └─ 若 bindRequiresDn=false：
+       直接用 loginName + password 绑定（适用于支持 UPN 格式的 AD）
+```
+
+### 3.3.2 用户资料持久化时机
+
+`LdapManager` 和 `LdapCredentialsSubscriber` 中的 `updateUser()`、`hydrateUser()` 等方法**只修改内存中的 User 对象，不主动持久化到数据库**。持久化发生在后续事件中：
+
+**场景一：首次登录（新用户）**
+
+```
+1. LdapUserProvider::loadUserByIdentifier()
+   → LdapManager::findUserByUsername()
+   → hydrate() 创建新 User 对象（id=null，未持久化）
+2. LdapCredentialsSubscriber::onCheckPassport()
+   → updateUser() 修改 User 属性（auth=ldap，email，roles 等）
+   → User 仍在内存，未写入数据库
+3. LoginSuccessEvent 触发
+   → LastLoginSubscriber::onFormLogin() [L42-L49](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/EventSubscriber/LastLoginSubscriber.php#L42-L49)
+     → user->setLastLogin(now)
+     → UserRepository::saveUser($user)  ← 首次持久化
+       → EntityManager::persist() + flush()
+```
+
+**场景二：已有用户登录**
+
+```
+1. ChainUserProvider 先从数据库加载 User（已持久化，id!=null）
+2. LdapCredentialsSubscriber::onCheckPassport()
+   → updateUser() 修改内存中的 User 属性
+3. LoginSuccessEvent 触发
+   → LastLoginSubscriber::onFormLogin()
+     → setLastLogin() + saveUser() ← 更新已存在记录
+```
+
+**场景三：会话刷新（refreshUser）**
+
+```
+LdapUserProvider::refreshUser($user)
+  → LdapManager::updateUser($user) ← 修改内存对象
+  → return $user
+```
+
+此处不调用 saveUser()，但由于 User 是 Doctrine 托管实体（id!=null），属性变更会在请求结束时由 Doctrine 的 `UnitOfWork` 自动检测并在 `kernel.terminate` 阶段 flush 到数据库。
+
+**与 SAML 的对比**：[SamlProvider::findUser()](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Saml/SamlProvider.php#L33-L61) 在 hydrate 后立即显式调用 `$this->userService->saveUser($user)`，而 LDAP 采用「修改内存对象 + 后续事件统一持久化」的模式。
 
 ### 3.4 阶段四：会话刷新
 
@@ -332,6 +416,9 @@ for each group entry:
 | 用户搜索返回多条结果 | **抛 LdapDriverException** | [findUserByUsername L43-L44](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapManager.php#L43-L44) |
 | DN 查找失败 | **抛 LdapDriverException('Failed fetching user DN')** | [updateUser L86-L88](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapManager.php#L86-L88) |
 | 属性查询返回 0 条结果 | **直接 return，不修改用户** | [updateUser L98-L99](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapManager.php#L98-L99) |
+| 新用户登录时 id=null（未持久化） | **后续 LoginSuccessEvent 中 saveUser() 写入 DB** | [LastLoginSubscriber L48](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/EventSubscriber/LastLoginSubscriber.php#L48-L48) |
+| 会话刷新时 updateUser() 修改了属性 | **Doctrine UnitOfWork 自动检测变更，请求结束时 flush** | Doctrine ORM 内置机制 |
+| bind 时传入登录名而非 DN（bindRequiresDn=true） | **Laminas 底层用 accountFilterFormat 自动查 DN 后再绑定** | Laminas\Ldap 内部 |
 
 ---
 
@@ -373,14 +460,17 @@ LDAP 用户的 DN 可能变更（例如用户在目录树中被移动）。Kimai
 1. **`ldap.connection.baseDn` 缺失时**：从 `ldap.user.baseDn` 复制
 2. **`ldap.connection.accountFilterFormat` 缺失且 `bindRequiresDn=true` 时**：自动生成 `(&{user.filter}({usernameAttribute}=%s))`
 
-这使得用户只需配置 `ldap.user.baseDn` 和 `ldap.user.filter`，连接参数可以自动推导。
+第 2 步的自动生成与 **登录名→DN 解析**直接相关（详见 [3.3.1](#331-绑定身份时登录名与目录-dn-的区分)）：
+- `%s` 是登录名占位符
+- Laminas\Ldap 用此过滤器先查询到用户 DN，再用 DN 执行绑定
+- 这使得用户只需配置 `ldap.user.baseDn` 和 `ldap.user.filter`，连接参数可以自动推导
 
 ---
 
 ## 11. 端到端流程图
 
 ```
-用户提交登录表单
+用户提交登录表单 (_username, _password)
   │
   ▼
 LdapAuthenticator::supports()
@@ -392,23 +482,34 @@ LdapAuthenticator::authenticate()
   ├─ 委托 form_login::authenticate()
   │   → ChainUserProvider 查用户
   │     ├─ DB 中找到 → 返回已有 User（auth=kimai 或 auth=ldap）
-  │     └─ DB 没有 → LdapUserProvider 查 LDAP → hydrate 新 User
+  │     └─ DB 没有 → LdapUserProvider::loadUserByIdentifier()
+  │                   → LdapManager::findUserByUsername()
+  │                   → hydrate() 新 User（内存中，id=null）
   └─ 挂载 LdapBadge 到 Passport
       │
       ▼
 CheckPassportEvent → LdapCredentialsSubscriber
   ├─ 无 LdapBadge → 不处理
   └─ 有 LdapBadge →
-      ├─ LdapManager::bind(username, password)
-      │   ├─ 成功 → updateUser() 同步属性+角色 → markResolved()
-      │   └─ 失败 →
-      │       ├─ 内部用户 → return（降级到本地密码校验）
-      │       └─ LDAP 用户 → 抛 BadCredentialsException
+      ├─ LdapManager::bind(loginName, password)
+      │    → Laminas\Ldap 底层处理：
+      │       ├─ bindRequiresDn=true → 用 accountFilterFormat 查 DN → DN 绑定
+      │       └─ bindRequiresDn=false → 直接用 loginName 绑定
+      │    ├─ 成功 → updateUser() 同步属性+角色 → markResolved()
+      │    └─ 失败 →
+      │        ├─ 内部用户 → return（降级到本地密码校验）
+      │        └─ LDAP 用户 → 抛 BadCredentialsException
       │
       ▼
-认证成功 → Symfony 生成安全 Token
+LoginSuccessEvent → LastLoginSubscriber::onFormLogin()
+  ├─ setLastLogin(now)
+  └─ UserRepository::saveUser($user) ← 写入数据库（persist + flush）
+      │
+      ▼
+认证成功 → Symfony 生成安全 Token → 存入 Session
   │
   ▼
 后续请求会话刷新 → LdapUserProvider::refreshUser()
   → LdapManager::updateUser() — 每次刷新都重新同步
+  → Doctrine UnitOfWork 自动 flush 变更到数据库
 ```
