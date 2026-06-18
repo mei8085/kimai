@@ -96,7 +96,7 @@ LdapAuthenticator::authenticate($request)
 CheckPassportEvent 触发
   → LdapCredentialsSubscriber 检测到 LdapBadge 且未 resolved
   → 取出 PasswordCredentials，取得明文密码
-  → LdapManager::bind(username, password)  — 以用户 DN+密码尝试绑定
+  → LdapManager::bind(loginName, password)  — 传入登录名，底层可能自动解析为 DN
       ├─ 绑定成功：
       │   → LdapManager::updateUser($user) — 同步属性 + 角色
       │   → PasswordCredentials::markResolved() — 阻止 form_login 再次校验
@@ -189,24 +189,28 @@ LdapUserProvider::refreshUser($user)
   → return $user
 ```
 
-此处不调用 saveUser()，但由于 User 是 Doctrine 托管实体（id!=null），属性变更会在请求结束时由 Doctrine 的 `UnitOfWork` 自动检测并在 `kernel.terminate` 阶段 flush 到数据库。
+此处**不调用** `saveUser()`，项目代码中也没有任何位置在 `refreshUser` 之后显式执行 persist 或 flush。`updateUser()` 只修改内存中的 User 对象属性，是否落库取决于对象是否处于 Doctrine 托管状态以及请求后续是否触发 flush。
 
-**与 SAML 的对比**：[SamlProvider::findUser()](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Saml/SamlProvider.php#L33-L61) 在 hydrate 后立即显式调用 `$this->userService->saveUser($user)`，而 LDAP 采用「修改内存对象 + 后续事件统一持久化」的模式。
+> **重要说明**：项目内没有 `refreshUser` 后主动保存的代码证据。`LdapManager` 只负责修改内存对象，不负责持久化，这与登录流程中 `LastLoginSubscriber` 显式调用 `saveUser()` 的模式不同。
+
+**Provider 选择顺序**：ChainUserProvider 按 `kimai_internal` → `kimai_ldap` 顺序尝试。对于已持久化的 LDAP 用户（id!=null），EntityUserProvider 可从数据库加载并返回，`LdapUserProvider::refreshUser()` 是否被调用取决于 ChainUserProvider 的异常传播逻辑。`LdapUserProvider` 对非 LDAP 用户会抛 `UnsupportedUserException` 以让 ChainUserProvider 跳过。
+
+**与 SAML 的对比**：[SamlProvider::findUser()](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Saml/SamlProvider.php#L33-L61) 在 hydrate 后立即显式调用 `$this->userService->saveUser($user)`，而 LDAP 的登录流程采用「修改内存对象 + LoginSuccessEvent 统一持久化」的解耦模式，refreshUser 阶段则没有显式持久化。
 
 ### 3.4 阶段四：会话刷新
 
 [LdapUserProvider::refreshUser()](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapUserProvider.php#L53-L69)
 
-当用户已登录、会话需要刷新时：
+当用户已登录、会话需要刷新时，`ChainUserProvider` 按顺序尝试各 provider：
 
 ```
 LdapUserProvider::refreshUser($user)
-  → 检查 $user 是否为 User 实例
-  → 检查 $user->isLdapUser() — 仅处理 LDAP 用户
-  → LdapManager::updateUser($user) — 每次会话刷新都重新同步属性和角色
+  → 检查 $user 是否为 User 实例 → 非 User 抛 UnsupportedUserException
+  → 检查 $user->isLdapUser() — 非 LDAP 用户抛 UnsupportedUserException（让链继续）
+  → LdapManager::updateUser($user) — 从 LDAP 重新同步属性和角色（仅内存修改）
 ```
 
-非 LDAP 用户的刷新由 `kimai_internal`（Entity Provider）处理。
+> **注意**：ChainUserProvider 顺序为 `kimai_internal` → `kimai_ldap`。对于已持久化的 LDAP 用户，EntityUserProvider 可从数据库加载并返回，`LdapUserProvider::refreshUser()` 是否被调用取决于 ChainUserProvider 的异常传播逻辑。非 LDAP 用户的刷新直接由 `kimai_internal`（Entity Provider）处理。
 
 ---
 
@@ -417,8 +421,8 @@ for each group entry:
 | DN 查找失败 | **抛 LdapDriverException('Failed fetching user DN')** | [updateUser L86-L88](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapManager.php#L86-L88) |
 | 属性查询返回 0 条结果 | **直接 return，不修改用户** | [updateUser L98-L99](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapManager.php#L98-L99) |
 | 新用户登录时 id=null（未持久化） | **后续 LoginSuccessEvent 中 saveUser() 写入 DB** | [LastLoginSubscriber L48](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/EventSubscriber/LastLoginSubscriber.php#L48-L48) |
-| 会话刷新时 updateUser() 修改了属性 | **Doctrine UnitOfWork 自动检测变更，请求结束时 flush** | Doctrine ORM 内置机制 |
-| bind 时传入登录名而非 DN（bindRequiresDn=true） | **Laminas 底层用 accountFilterFormat 自动查 DN 后再绑定** | Laminas\Ldap 内部 |
+| 会话刷新时 updateUser() 修改了属性 | **仅修改内存对象，项目内无显式保存调用**，是否落库取决于 Doctrine 托管状态 | `LdapUserProvider::refreshUser()` 内无 persist/flush |
+| bind 时传入登录名而非 DN（bindRequiresDn=true） | **Laminas 底层用 accountFilterFormat 查 DN 后再绑定**，代码层面传入的是登录名 | [LdapCredentialsSubscriber L64](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapCredentialsSubscriber.php#L64-L64) |
 
 ---
 
@@ -510,6 +514,6 @@ LoginSuccessEvent → LastLoginSubscriber::onFormLogin()
   │
   ▼
 后续请求会话刷新 → LdapUserProvider::refreshUser()
-  → LdapManager::updateUser() — 每次刷新都重新同步
-  → Doctrine UnitOfWork 自动 flush 变更到数据库
+  → LdapManager::updateUser() — 同步属性（仅内存，项目内无显式保存）
+  → 是否落库取决于 Doctrine 托管状态与后续 flush 触发
 ```
