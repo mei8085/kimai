@@ -71,7 +71,22 @@ interface PluginInterface
 
 ### 5. 插件路由自动加载
 
-[Kernel.php L168-L192](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/Kernel.php#L168-L192) 的 `configureRoutes()` 方法遍历所有 Bundle，对实现了 `PluginInterface` 或命名空间在 `KimaiPlugin\` 下的 Bundle，自动导入其 `Resources/config/routes` 或 `config/routes` 目录下的路由文件。应用核心路由最后加载，确保插件无法覆盖核心路由。
+[Kernel.php L168-L192](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/Kernel.php#L168-L192) 的 `configureRoutes()` 方法遍历所有 Bundle，对实现了 `PluginInterface` 或命名空间在 `KimaiPlugin\` 下的 Bundle，自动导入其路由配置文件：
+
+```php
+// Kernel.php L180-L188
+foreach ($this->getBundles() as $bundle) {
+    if ($bundle instanceof PluginInterface || str_contains(\get_class($bundle), 'KimaiPlugin\\')) {
+        if (is_dir($bundle->getPath() . '/Resources/config/')) {
+            $routes->import($bundle->getPath() . '/Resources/config/routes' . self::CONFIG_EXTS);
+        } elseif (is_dir($bundle->getPath() . '/config/')) {
+            $routes->import($bundle->getPath() . '/config/routes' . self::CONFIG_EXTS);
+        }
+    }
+}
+```
+
+注意 `self::CONFIG_EXTS` 的值是 `.{php,yaml,yml,xml}`，因此 `import()` 目标是**路由配置文件**（如 `routes.yaml`、`routes.php`），而非 `routes/` 子目录。当 `Resources/config/` 或 `config/` 目录存在时，分别导入其中匹配 `routes.*` 模式的配置文件。应用核心路由最后加载（L191），确保插件无法覆盖核心路由。
 
 ---
 
@@ -117,7 +132,8 @@ Kimai 通过 Symfony EventDispatcher 机制暴露扩展点。
           → 插件 A 的 EventSubscriber::onMainMenuConfigure() [优先级 < 100]
           → 插件 B 的 EventSubscriber::onMainMenuConfigure() [优先级 < 100]
         → 返回填充完毕的 ConfigureMainMenuEvent
-      → MenuBuilderSubscriber 将事件中 4 个根节点的子项逐一添加到 Tabler MenuEvent
+      → main 区子项逐个 addItem（扁平化）
+      → apps/admin/system 根节点整体 addItem（折叠式）
       → 按当前路由激活对应菜单项
 ```
 
@@ -177,12 +193,42 @@ class MyPluginMenuSubscriber implements EventSubscriberInterface
 
 ### MenuBuilderSubscriber：从 Kimai 事件到 Tabler 渲染
 
-[MenuBuilderSubscriber](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/EventSubscriber/MenuBuilderSubscriber.php#L35-L62) 是连接 Kimai 菜单体系与 Tabler 主题的桥梁：
+[MenuBuilderSubscriber](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/EventSubscriber/MenuBuilderSubscriber.php#L35-L62) 是连接 Kimai 菜单体系与 Tabler 主题的桥梁。渲染时对四个区域的处理方式不同：
 
-1. 监听 Tabler 的 `MenuEvent`
-2. 调用 `MenuService::getKimaiMenu()` 获取已填充的 `ConfigureMainMenuEvent`
-3. 将 4 个根节点的子项逐一 `addItem` 到 Tabler MenuEvent（跳过无路由且无子项的空节点）
-4. 按当前请求路由递归匹配并标记 `isActive`
+```php
+// MenuBuilderSubscriber.php L37-L54
+$menuEvent = $this->menuService->getKimaiMenu();
+
+// main 区：逐个子项加入（扁平化，不含根节点自身）
+foreach ($menuEvent->getMenu()->getChildren() as $child) {
+    if ($child->getRoute() === null && !$child->hasChildren()) {
+        continue;
+    }
+    $event->addItem($child);
+}
+
+// apps/admin/system 区：整个根节点作为一项加入（含子项的树结构）
+if ($menuEvent->getAppsMenu()->hasChildren()) {
+    $event->addItem($menuEvent->getAppsMenu());
+}
+if ($menuEvent->getAdminMenu()->hasChildren()) {
+    $event->addItem($menuEvent->getAdminMenu());
+}
+if ($menuEvent->getSystemMenu()->hasChildren()) {
+    $event->addItem($menuEvent->getSystemMenu());
+}
+```
+
+| 区域 | 渲染方式 | 效果 |
+|------|----------|------|
+| `$menu`（main 区） | **子项逐个加入**：遍历 `getChildren()`，跳过无路由且无子项的空节点，每个子项单独 `addItem` | 顶层平铺，Dashboard、Times、Invoice 等各自作为独立的一级菜单项 |
+| `$apps`（apps 区） | **根节点整体加入**：直接 `addItem($menuEvent->getAppsMenu())`，前提 `hasChildren()` | 作为带子菜单的折叠项出现 |
+| `$admin`（admin 区） | **根节点整体加入**：直接 `addItem($menuEvent->getAdminMenu())`，前提 `hasChildren()` | "Administration" 折叠项，内含 Customers、Projects 等子项 |
+| `$system`（system 区） | **根节点整体加入**：直接 `addItem($menuEvent->getSystemMenu())`，前提 `hasChildren()` | "System" 折叠项，内含 Users、Roles 等子项 |
+
+这意味着：
+- main 区的子项在侧边栏是**平级的一级条目**，可折叠的是其自身的子项（如 Times 下挂 Timesheet/Calendar 等）
+- apps/admin/system 三个区域在侧边栏是**折叠式一级条目**，标题分别是"Applications"、"Administration"、"System"，子项在折叠内
 
 ---
 
@@ -368,7 +414,27 @@ public function hasRolePermission(User $user, string $permission): bool
 权限展示分区与权限注册是完全解耦的。[PermissionController::permissions()](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/Controller/PermissionController.php#L52-L169) 中：
 
 1. **PermissionSectionsEvent** [L99-L103](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/Controller/PermissionController.php#L99-L103)：
-   - 核心预定义 19 个分区（Export、Invoice、Teams、Tags、User、Customer、Project、Activity、Timesheet 等）
+   - 核心预定义 20 个分区，按 [PermissionController.php L76-L97](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/Controller/PermissionController.php#L76-L97) 中 `$permissionOrder` 数组顺序排列：
+     1. Export（`_export`）
+     2. Invoice（`_invoice`）
+     3. Teams（`_team`）
+     4. Tags（`_tag`）
+     5. User profile (other)（`_other_profile`）
+     6. User profile (own)（`_own_profile`）
+     7. User（`_user`）
+     8. Customer (Admin)（`_customer`）
+     9. Customer (Team member)（`_team_customer`）
+     10. Customer (Teamlead)（`_teamlead_customer`）
+     11. Project (Admin)（`_project`）
+     12. Project (Team member)（`_team_project`）
+     13. Project (Teamlead)（`_teamlead_project`）
+     14. Activity (Admin)（`_activity`）
+     15. Activity (Team member)（`_team_activity`）
+     16. Activity (Teamlead)（`_teamlead_activity`）
+     17. Timesheet（`_timesheet`）
+     18. Timesheet (other)（`_other_timesheet`）
+     19. Timesheet (own)（`_own_timesheet`）
+     20. Reporting（`_reporting`）
    - dispatch 后插件可调用 `addSection()` 追加自定义分区
    - [PermissionSection](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/Model/PermissionSection.php) 的 `filter()` 通过 `str_contains` 匹配权限名，将权限归入对应分区展示
 
@@ -492,7 +558,7 @@ Kernel
   │                            ├─ 【非权限入口】合并 kimai.bundles.config（插件自定义配置）
   │                            └─ 生成 kimai.config 扁平参数
   │
-  └─ configureRoutes() ──→ 自动导入插件 routes
+  └─ configureRoutes() ──→ 导入插件路由配置文件（routes.yaml 等）
 
 Plugin Bundle
   ├─ DependencyInjection/MyPluginExtension.php
@@ -515,7 +581,10 @@ MenuService
 
 MenuBuilderSubscriber
   └─ onSetupNavbar(Tabler MenuEvent)
-       └─ MenuService::getKimaiMenu() ──→ 转换到 Tabler 渲染
+       ├─ MenuService::getKimaiMenu()
+       ├─ main 区：子项逐个 addItem（扁平化，跳过空节点）
+       ├─ apps/admin/system：根节点整体 addItem（折叠式，前提 hasChildren）
+       └─ activateByRoute() 递归匹配激活
 
 RolePermissionManager
   ├─ 注入 %kimai.permissions% 和 %kimai.permission_names%
