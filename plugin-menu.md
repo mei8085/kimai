@@ -209,10 +209,21 @@ Kimai 的权限体系分为三个独立层面，各自作用不同，不可混�
 - `maps`：角色到集合的映射（如 `ROLE_ADMIN: ['ACTIVITIES', 'PROJECTS', ...]`）
 - `roles`：角色到权限名的直接映射（用于添加未归类到 set 的单个权限）
 
-插件注入权限的标准方式是通过 **Symfony 配置树合并**：
-- 插件的 Extension 类通过 `prependExtensionConfig('kimai', [...])` 或在自己的配置文件中定义 `kimai.permissions` 节点
-- Symfony 在调用 `AppExtension::load()` 时，所有 `kimai` 配置（核心 + 插件）已被收集到 `$configs` 数组中
-- `$this->processConfiguration($configuration, $configs)` 按照 [Configuration](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/DependencyInjection/Configuration.php#L657-L705) 中定义的权限配置树进行合并
+插件注入权限的标准方式是通过 **Symfony 配置树合并机制**。仓内可见的唯一合并入口是 [AppExtension::load()](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/DependencyInjection/AppExtension.php#L24-L32)：
+
+```php
+public function load(array $configs, ContainerBuilder $container): void
+{
+    $configuration = new Configuration();
+    $config = $this->processConfiguration($configuration, $configs);
+    // ...
+    $this->createPermissionParameter($config['permissions'], $container);
+}
+```
+
+- Symfony DI 容器在调用 `AppExtension::load()` 之前，已按标准流程把所有来自 `config/packages/`、`config/packages/{env}/`、以及通过 `config/packages/{env}.yaml`（如 `when@test:` 块）加载的 `kimai` 配置合并到了 `$configs` 数组中
+- `$this->processConfiguration($configuration, $configs)` 按照 [Configuration](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/DependencyInjection/Configuration.php#L657-L705) 中定义的权限配置树对所有配置进行规范化合并
+- 插件只需将自己的 `kimai.permissions` 配置节点置于 Symfony 可加载的配置路径中，即可被纳入合并范围。仓内**未出现** `prependExtensionConfig` 的调用，不将其视作必要或已证实的 API
 
 #### 2. AppExtension 编译处理
 
@@ -268,26 +279,89 @@ if ($container->hasParameter('kimai.bundles.config')) {
 
 插件通过 [AbstractPluginExtension::registerBundleConfiguration()](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/Plugin/AbstractPluginExtension.php#L17-L30) 将自定义配置写入 `kimai.bundles.config` 参数。
 
-#### 4. RolePermissionManager 运行时校验
+#### 4. 权限名注册检查的两个承担者
 
-[RolePermissionManager](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/Security/RolePermissionManager.php#L21-L116) 构造时注入编译好的容器参数：
+`isRegisteredPermission()` 检查由**投票器（Voter）**和**权限保存入口**两个地方承担，各自职责不同：
+
+**1) 投票器：`isGranted()` 调用时的权限过滤**
+
+[RolePermissionVoter](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/Voter/RolePermissionVoter.php) 是 Symfony 安全组件中处理所有 `isGranted()` 调用的投票器之一。它通过 `supportsAttribute()` 对权限名进行前置过滤：
 
 ```php
-public function __construct(
-    private readonly PermissionService $service,
-    private array $permissions,      // %kimai.permissions%
-    private readonly array $permissionNames  // %kimai.permission_names%
-)
+// RolePermissionVoter.php L28-L31
+public function supportsAttribute(string $attribute): bool
+{
+    return $this->permissionManager->isRegisteredPermission($attribute);
+}
 ```
 
-`isRegisteredPermission()` 仅检查 `$permissionNames` 数组键名，未在此注册的权限会被拒绝保存：
+```php
+// RolePermissionVoter.php L39-L53
+protected function supports(string $attribute, mixed $subject): bool
+{
+    return $subject === null && $this->supportsAttribute($attribute);
+}
+
+protected function voteOnAttribute(string $attribute, mixed $subject, TokenInterface $token): bool
+{
+    $user = $token->getUser();
+    if (!($user instanceof User)) {
+        return false;
+    }
+    return $this->permissionManager->hasRolePermission($user, $attribute);
+}
+```
+
+- 未在 `kimai.permission_names` 中注册的权限，`supportsAttribute()` 返回 `false`，投票器**弃权**（`ACCESS_ABSTAIN`）
+- 已注册的权限，`voteOnAttribute()` 调用 `hasRolePermission()` 判断角色是否拥有该权限
+
+**2) 权限保存入口：防止写入未知权限**
+
+[PermissionController::savePermission()](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/Controller/PermissionController.php#L233-L269) 是管理员通过 UI 修改角色权限的 HTTP 入口，在写入数据库前做注册检查：
 
 ```php
-// PermissionController.php L240-L241
+// PermissionController.php L240-L242
 if (!$this->manager->isRegisteredPermission($name)) {
     throw $this->createNotFoundException('Unknown permission: ' . $name);
 }
 ```
+
+通过这个检查，防止任意未经注册的权限名被写入 `kimai_role_permission` 表。
+
+#### 5. `hasPermission()` 只判断角色是否拥有权限
+
+[RolePermissionManager::hasPermission()](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/Security/RolePermissionManager.php#L82-L93) 和 [hasRolePermission()](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/Security/RolePermissionManager.php#L95-L106) **不做权限名注册检查**，只做角色-权限关联的纯查询：
+
+```php
+public function hasPermission(string $role, string $permission): bool
+{
+    $this->init();
+    $role = strtoupper($role);
+    if (!\array_key_exists($role, $this->permissions)) {
+        return false;
+    }
+    return \array_key_exists($permission, $this->permissions[$role]) && $this->permissions[$role][$permission];
+}
+```
+
+```php
+public function hasRolePermission(User $user, string $permission): bool
+{
+    $this->init();
+    foreach ($user->getRoles() as $role) {
+        if ($this->hasPermission($role, $permission)) {
+            return true;
+        }
+    }
+    return false;
+}
+```
+
+`hasPermission()` 的查找来源：
+- 编译期默认值：来自 `kimai.permissions` 容器参数（即 kimai.yaml `roles` 节 + 展开后的 `maps` 节）
+- 运行期覆盖值：来自 `kimai_role_permission` 表（管理员通过 UI 修改后持久化的值），通过 `init()` 方法内的 [PermissionService::getPermissions()](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/User/PermissionService.php#L50-L61) 查询并合并
+
+**结论**：权限名注册检查（`isRegisteredPermission`）只存在于投票器和权限保存入口；`hasPermission` / `hasRolePermission` 本身不校验权限名的合法性，依赖上游调用者先通过 `supportsAttribute` 或控制器前置检查完成过滤。
 
 ### 权限展示分区扩展（UI 层）
 
@@ -310,22 +384,44 @@ if (!$this->manager->isRegisteredPermission($name)) {
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │ 权限注册（编译期，必须先做）                                  │
-│  kimai.permissions YAML 配置                                 │
-│    → Symfony 配置树合并                                      │
+│  kimai.permissions YAML 配置（核心 + 插件）                   │
+│    → Symfony 配置树合并到 $configs                           │
 │    → AppExtension::createPermissionParameter()               │
-│    → 容器参数 kimai.permission_names                         │
+│    → 容器参数 kimai.permission_names + kimai.permissions     │
 │                                                              │
-│  结果：权限名被系统承认，isRegisteredPermission() 返回 true   │
+│  结果：权限名被系统承认                                       │
 └───────────────────────────┬─────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ 菜单鉴权（运行期，依赖权限注册）                              │
+│ 权限名注册检查（运行期入口守卫）                              │
+│                                                              │
+│  ┌─ RolePermissionVoter::supportsAttribute() ──┐            │
+│  │  isRegisteredPermission() 过滤 isGranted()   │            │
+│  │  未注册 → 投票器弃权（ACCESS_ABSTAIN）        │            │
+│  └──────────────────────────────────────────────┘            │
+│                                                              │
+│  ┌─ PermissionController::savePermission() ─────┐           │
+│  │  isRegisteredPermission() 过滤 HTTP 写入请求  │           │
+│  │  未注册 → 抛出 NotFoundException              │           │
+│  └──────────────────────────────────────────────┘            │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 角色权限查询（运行期纯查询）                                 │
+│  hasPermission() / hasRolePermission()                       │
+│    → 不校验权限名合法性（依赖上游过滤）                       │
+│    → 合并 kimai.permissions 默认值 + 数据库覆盖值            │
+│    → 按角色名查找该权限是否为 true                           │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 菜单鉴权（运行期，消费端）                                   │
 │  MenuSubscriber / 插件 Subscriber                            │
 │    → $auth->isGranted('my_permission')                       │
-│    → RolePermissionManager::hasRolePermission()              │
-│    → 检查 kimai.permission_names 确认权限已注册               │
-│    → 检查数据库 / kimai.permissions 确认角色有权限            │
+│    → RolePermissionVoter 链 → supportsAttribute → voteOnAttr│
 │                                                              │
 │  结果：有权限则注入菜单项，无权限则跳过                        │
 └───────────────────────────┬─────────────────────────────────┘
@@ -343,15 +439,15 @@ if (!$this->manager->isRegisteredPermission($name)) {
 ```
 
 关键理解：
-- **权限注册是前提**：未注册的权限无法通过 `isRegisteredPermission()`，`isGranted()` 永远返回 false，菜单项永远不会显示
-- **展示分区不影响权限有效性**：一个权限即使不在任何展示分区，只要在 `kimai.permission_names` 中，就可以正常用于 `isGranted()` 检查
-- **菜单鉴权是权限的应用**：菜单注入时的 `isGranted()` 守卫是权限注册的消费端，两者通过 `kimai.permission_names` 容器参数关联
+- **权限注册是总前提**：未注册的权限在两个入口（投票器、保存接口）都会被拦下，`isGranted()` 无法通过，权限无法写入数据库
+- **注册检查与角色查询分离**：`isRegisteredPermission` 只在入口（投票器 / 保存接口）检查；`hasPermission` / `hasRolePermission` 纯查询，不校验合法性
+- **菜单鉴权不直接调用注册检查**：MenuSubscriber 中 `isGranted()` → Symfony Security → RolePermissionVoter → `supportsAttribute()` 隐式完成注册检查，对 MenuSubscriber 透明
+- **展示分区不影响权限有效性**：一个权限即使不在任何展示分区，只要在 `kimai.permission_names` 中，就可以正常通过投票器参与 `isGranted()` 检查
 
 ### 插件权限 → 菜单联动的完整示例
 
 ```
-1. 插件 Extension 注入权限（编译期）：
-   插件自己的 Extension 中 prepend 或直接定义：
+1. 插件权限配置（编译期，需要把配置节点挂载到 Symfony 可加载的配置路径中）：
    kimai:
      permissions:
        sets:
@@ -401,7 +497,7 @@ Kernel
 Plugin Bundle
   ├─ DependencyInjection/MyPluginExtension.php
   │   ├─ load() ──→ 加载插件自己的 services.yaml（autoconfigure 扫描 src/）
-  │   ├─ 【权限注入】prependExtensionConfig('kimai', ['permissions' => ...])
+  │   ├─ 加载自己的 kimai.permissions 配置节点（通过 Symfony 标准配置路径）
   │   └─ registerBundleConfiguration() ──→ 写入 kimai.bundles.config
   │
   └─ src/EventSubscriber/
@@ -423,9 +519,17 @@ MenuBuilderSubscriber
 
 RolePermissionManager
   ├─ 注入 %kimai.permissions% 和 %kimai.permission_names%
-  └─ isRegisteredPermission() ──→ 检查权限是否已注册
+  ├─ isRegisteredPermission() ──→ 检查权限是否已注册
+  ├─ hasPermission() ──→ 【纯查询，不校验注册】查角色是否拥有权限
+  └─ hasRolePermission() ──→ 【纯查询，不校验注册】按用户所有角色遍历查询
+
+RolePermissionVoter
+  ├─ supportsAttribute() ──→ 调用 isRegisteredPermission() 做入口过滤
+  └─ voteOnAttribute() ──→ 调用 hasRolePermission() 做结果判定
 
 PermissionController
+  ├─ savePermission()
+  │    └─ isRegisteredPermission() ──→ 写入数据库前的入口守卫
   └─ permissions()
        ├─ dispatch(PermissionSectionsEvent) ──→ 核心分区 + 插件分区（UI 分组）
        ├─ 按 filter() 将已注册权限归入各分区
