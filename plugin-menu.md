@@ -86,7 +86,7 @@ foreach ($this->getBundles() as $bundle) {
 }
 ```
 
-注意 `self::CONFIG_EXTS` 的值是 `.{php,yaml,yml,xml}`，因此 `import()` 目标是**路由配置文件**（如 `routes.yaml`、`routes.php`），而非 `routes/` 子目录。当 `Resources/config/` 或 `config/` 目录存在时，分别导入其中匹配 `routes.*` 模式的配置文件。应用核心路由最后加载（L191），确保插件无法覆盖核心路由。
+注意 `self::CONFIG_EXTS` 在 [Kernel.php L35](file:///d:/fz/0601-2/solo-dogfeeding/code/37-kimai/src/Kernel.php#L35) 的实际取值是 `.{php,yaml}`，因此 `import()` 目标是**路由配置文件**（即 `Resources/config/routes.php` 或 `Resources/config/routes.yaml`），而非 `routes/` 子目录。当 `Resources/config/` 或 `config/` 目录存在时，分别导入其中匹配该模式的配置文件。应用核心路由最后加载（L191），确保插件无法覆盖核心路由。
 
 ---
 
