@@ -9,7 +9,7 @@ LDAP 功能由 `src/Ldap/` 目录下的一组类协作完成，核心参与方�
 | [LdapAuthenticator](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapAuthenticator.php) | 认证入口，装饰 Symfony 原生 `form_login` 认证器，在 Passport 上挂载 `LdapBadge` |
 | [LdapCredentialsSubscriber](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapCredentialsSubscriber.php) | 监听 `CheckPassportEvent`，检测 `LdapBadge` 后执行 LDAP bind + 属性同步 |
 | [LdapManager](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapManager.php) | 核心业务：LDAP 查询、用户水合（hydrate）、属性映射、角色同步 |
-| [LdapUserProvider](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapUserProvider.php) | Symfony `UserProviderInterface` 实现，提供 `loadUserByIdentifier` 与 `refreshUser` |
+| [LdapUserProvider](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapUserProvider.php) | Symfony `UserProviderInterface` 实现；`loadUserByIdentifier` 查 LDAP 水合新用户，`refreshUser` 仅在 DB 查不到时兜底 |
 | [LdapDriver](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapDriver.php) | 底层 LDAP 操作封装（search / bind），委托 Laminas\Ldap |
 | [LdapConfiguration](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Configuration/LdapConfiguration.php) | 从 `SystemConfiguration` 读取 `ldap.*` 配置节 |
 | [KimaiUserProvider](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Security/KimaiUserProvider.php) | Chain Provider，串联内部数据库 provider 与 LDAP provider |
@@ -184,33 +184,55 @@ $this->ldapManager->bind($user->getUserIdentifier(), $presentedPassword)
 **场景三：会话刷新（refreshUser）**
 
 ```
-LdapUserProvider::refreshUser($user)
-  → LdapManager::updateUser($user) ← 修改内存对象
-  → return $user
+KimaiUserProvider::refreshUser($user)
+  → ChainUserProvider 按顺序尝试
+    ├─ kimai_internal（EntityUserProvider）
+    │   → UserRepository::refreshUser()
+    │   → loadUserByIdentifier() 从数据库重新加载
+    │   → 成功找到 → 返回（ChainUserProvider 终止，不再继续）
+    │   → 找不到 → 抛 UserNotFoundException
+    └─ kimai_ldap（LdapUserProvider）
+        → 仅在 EntityUserProvider 失败/不支持时才会走到
+        → LdapManager::updateUser($user) ← 修改内存对象
+        → return $user
 ```
 
-此处**不调用** `saveUser()`，项目代码中也没有任何位置在 `refreshUser` 之后显式执行 persist 或 flush。`updateUser()` 只修改内存中的 User 对象属性，是否落库取决于对象是否处于 Doctrine 托管状态以及请求后续是否触发 flush。
+**关键结论**：对于已持久化的 LDAP 用户（auth=ldap 且 DB 中有记录），**会话刷新阶段不会触发 LDAP 属性同步**。因为 ChainUserProvider 先走 `kimai_internal`，EntityUserProvider 总能从 DB 加载用户并成功返回，`LdapUserProvider::refreshUser()` 根本不会被调用到。
 
-> **重要说明**：项目内没有 `refreshUser` 后主动保存的代码证据。`LdapManager` 只负责修改内存对象，不负责持久化，这与登录流程中 `LastLoginSubscriber` 显式调用 `saveUser()` 的模式不同。
+> `LdapUserProvider::refreshUser()` 的实际用途是兜底：当 DB 中找不到该用户（例如被管理员删除但 session 还在），fallback 到 LDAP 重新水合。
 
-**Provider 选择顺序**：ChainUserProvider 按 `kimai_internal` → `kimai_ldap` 顺序尝试。对于已持久化的 LDAP 用户（id!=null），EntityUserProvider 可从数据库加载并返回，`LdapUserProvider::refreshUser()` 是否被调用取决于 ChainUserProvider 的异常传播逻辑。`LdapUserProvider` 对非 LDAP 用户会抛 `UnsupportedUserException` 以让 ChainUserProvider 跳过。
+**Provider 选择的判定逻辑**：
+- `UserRepository::supportsClass(User::class)` 返回 `true` — 支持所有 User 实体
+- `UserRepository::refreshUser()` 调用 `loadUserByIdentifier()`，用户存在就返回，不存在抛 `UserNotFoundException`
+- `LdapUserProvider::refreshUser()` 对非 LDAP 用户抛 `UnsupportedUserException`，用于 ChainUserProvider 跳过
+- 两者都支持 `User::class`，但 EntityUserProvider 在链中排在前面
 
-**与 SAML 的对比**：[SamlProvider::findUser()](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Saml/SamlProvider.php#L33-L61) 在 hydrate 后立即显式调用 `$this->userService->saveUser($user)`，而 LDAP 的登录流程采用「修改内存对象 + LoginSuccessEvent 统一持久化」的解耦模式，refreshUser 阶段则没有显式持久化。
+**与 SAML 的对比**：[SamlProvider::findUser()](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Saml/SamlProvider.php#L33-L61) 在 hydrate 后立即显式调用 `$this->userService->saveUser($user)`，而 LDAP 的登录流程采用「修改内存对象 + LoginSuccessEvent 统一持久化」的解耦模式，refreshUser 阶段则通常不会触发 LDAP 同步。
 
 ### 3.4 阶段四：会话刷新
 
-[LdapUserProvider::refreshUser()](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapUserProvider.php#L53-L69)
-
-当用户已登录、会话需要刷新时，`ChainUserProvider` 按顺序尝试各 provider：
+会话刷新由 [KimaiUserProvider::refreshUser()](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Security/KimaiUserProvider.php#L66-L69) 发起，委托给内部 `ChainUserProvider`，按 `kimai_internal` → `kimai_ldap` 顺序尝试：
 
 ```
-LdapUserProvider::refreshUser($user)
-  → 检查 $user 是否为 User 实例 → 非 User 抛 UnsupportedUserException
-  → 检查 $user->isLdapUser() — 非 LDAP 用户抛 UnsupportedUserException（让链继续）
-  → LdapManager::updateUser($user) — 从 LDAP 重新同步属性和角色（仅内存修改）
+KimaiUserProvider::refreshUser($user)
+  → ChainUserProvider 遍历 providers
+    ├─ kimai_internal（EntityUserProvider）
+    │   → UserRepository::refreshUser($user) [L171-L177](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Repository/UserRepository.php#L171-L177)
+    │   → loadUserByIdentifier() 从 DB 重新加载
+    │   → 找到 → 直接返回（Chain 终止，LDAP provider 不会被调用）
+    │   → 未找到 → 抛 UserNotFoundException
+    │
+    └─ kimai_ldap（LdapUserProvider）
+        → 仅当前面的 provider 都失败时才进入
+        → [LdapUserProvider::refreshUser()](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapUserProvider.php#L53-L69)
+        → isLdapUser() 检查 → 非 LDAP 用户抛 UnsupportedUserException
+        → LdapManager::updateUser() 同步属性和角色（仅内存）
+        → return $user
 ```
 
-> **注意**：ChainUserProvider 顺序为 `kimai_internal` → `kimai_ldap`。对于已持久化的 LDAP 用户，EntityUserProvider 可从数据库加载并返回，`LdapUserProvider::refreshUser()` 是否被调用取决于 ChainUserProvider 的异常传播逻辑。非 LDAP 用户的刷新直接由 `kimai_internal`（Entity Provider）处理。
+**核心结论**：对于已持久化到数据库的 LDAP 用户（auth=ldap，DB 中有记录），**会话刷新阶段不会触发 LDAP 同步**。EntityUserProvider 排在链首，总能从 DB 加载用户并成功返回，LdapUserProvider 的 refreshUser() 根本不会被执行。
+
+> `LdapUserProvider::refreshUser()` 的实际作用是兜底通道：当 DB 中找不到该用户（如被管理员删除但 session 仍有效），fallback 到 LDAP 重新水合用户对象。非 LDAP 用户的刷新直接由 `kimai_internal` 完成。
 
 ---
 
@@ -421,7 +443,7 @@ for each group entry:
 | DN 查找失败 | **抛 LdapDriverException('Failed fetching user DN')** | [updateUser L86-L88](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapManager.php#L86-L88) |
 | 属性查询返回 0 条结果 | **直接 return，不修改用户** | [updateUser L98-L99](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapManager.php#L98-L99) |
 | 新用户登录时 id=null（未持久化） | **后续 LoginSuccessEvent 中 saveUser() 写入 DB** | [LastLoginSubscriber L48](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/EventSubscriber/LastLoginSubscriber.php#L48-L48) |
-| 会话刷新时 updateUser() 修改了属性 | **仅修改内存对象，项目内无显式保存调用**，是否落库取决于 Doctrine 托管状态 | `LdapUserProvider::refreshUser()` 内无 persist/flush |
+| 会话刷新时 updateUser() 修改了属性 | **仅修改内存对象，项目内无显式保存调用**；且对于已持久化用户，refreshUser 通常走 EntityUserProvider，根本不会走到 LdapUserProvider | `LdapUserProvider::refreshUser()` 内无 persist/flush；ChainUserProvider 顺序 kimai_internal 优先 |
 | bind 时传入登录名而非 DN（bindRequiresDn=true） | **Laminas 底层用 accountFilterFormat 查 DN 后再绑定**，代码层面传入的是登录名 | [LdapCredentialsSubscriber L64](file:///d:/fz/0601-2/solo-dogfeeding/code/38-kimai/src/Ldap/LdapCredentialsSubscriber.php#L64-L64) |
 
 ---
@@ -450,10 +472,15 @@ LDAP 用户的 DN 可能变更（例如用户在目录树中被移动）。Kimai
       → hydrateUser() 中 $user->setAuth(User::AUTH_LDAP)  — 无条件设置
 ```
 
-这意味着**一旦内部用户成功通过 LDAP 认证，其 auth 类型会被升级为 `ldap`**。之后该用户再登录时：
+这意味着**一旦内部用户成功通过 LDAP 认证，其 auth 类型会被升级为 `ldap`**。之后该用户的行为变化：
 
-- LDAP bind 失败 → 不再降级到本地密码，直接抛 `BadCredentialsException`
-- `LdapUserProvider::refreshUser()` 接管会话刷新
+| 行为 | 升级前（auth=kimai） | 升级后（auth=ldap） |
+|---|---|---|
+| **登录时 LDAP bind 失败** | 降级到本地密码校验 | 直接抛 `BadCredentialsException`，不降级 |
+| **会话刷新（refreshUser）** | EntityUserProvider 从 DB 加载 | EntityUserProvider 从 DB 加载（不变，仍走本地库） |
+| **loadUserByIdentifier 查找顺序** | 先 DB 后 LDAP | 先 DB 后 LDAP（不变，DB 中已有记录） |
+
+> **重要澄清**：认证类型升级**不会**让 `LdapUserProvider` 接管会话刷新。ChainUserProvider 始终按 `kimai_internal` → `kimai_ldap` 顺序尝试，EntityUserProvider 排在首位且对所有 User 实体都支持，因此只要用户在 DB 中存在，refreshUser 就走本地库。`auth=ldap` 仅影响：① `LdapCredentialsSubscriber` 中的降级策略，② `LdapUserProvider::refreshUser()` 内的 `isLdapUser()` 判断（但该方法通常不会被调用到）。
 
 ---
 
@@ -513,7 +540,8 @@ LoginSuccessEvent → LastLoginSubscriber::onFormLogin()
 认证成功 → Symfony 生成安全 Token → 存入 Session
   │
   ▼
-后续请求会话刷新 → LdapUserProvider::refreshUser()
-  → LdapManager::updateUser() — 同步属性（仅内存，项目内无显式保存）
-  → 是否落库取决于 Doctrine 托管状态与后续 flush 触发
+后续请求会话刷新 → KimaiUserProvider::refreshUser()
+  → ChainUserProvider 按 kimai_internal → kimai_ldap 顺序
+    ├─ kimai_internal → UserRepository::refreshUser() → 从 DB 重新加载（通常走这）
+    └─ kimai_ldap → LdapUserProvider::refreshUser() → 仅兜底，DB 无记录时才触发
 ```
