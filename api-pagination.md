@@ -15,21 +15,29 @@ ParamFetcher 注解声明参数 (FOSRestBundle)
     ▼
 Controller::cgetAction()
     ├── 1. 构建具体 Query 对象 (TimesheetQuery / UserQuery ...)
-    ├── 2. BaseApiController::prepareQuery() ── 解析通用分页/排序参数
+    ├── 2. BaseApiController::prepareQuery() ── 解析通用分页/排序参数（仅分页型端点）
     ├── 3. 手动解析业务过滤参数 (用户、时间范围、标签等)
     │
     ▼
-Repository::getPagerfantaForQuery(Query)
-    ├── A. countXxxForQuery(Query) ── 计算符合条件的总数
-    │     └── getQueryBuilderForQuery() → reset select/orderBy → COUNT()
-    ├── B. createXxxQuery(Query) ── 构建查询 DQL
-    │     └── getQueryBuilderForQuery() → 拼装 WHERE/ORDER/JOIN
-    └── C. 构造 LoaderQueryPaginator($loader, $query, $count)
-          │
-          ▼
-Pagination(Pagerfanta) 封装
-    ├── setMaxPerPage($query->getPageSize())
-    └── setCurrentPage($query->getPage())
+  ┌─ 分页型端点 ─────────────────────────────────────────────┐
+  │ Repository::getPagerfantaForQuery(Query)                   │
+  │   ├── A. countXxxForQuery() → getQueryBuilderForQuery()   │
+  │   │          → reset select/orderBy → COUNT()             │
+  │   ├── B. createXxxQuery() → getQueryBuilderForQuery()     │
+  │   │          → 拼装 WHERE/ORDER/JOIN                      │
+  │   └── C. LoaderQueryPaginator($loader, $query, $count)   │
+  └────────────────────────────────────────────────────────────┘
+  ┌─ 全量型端点 ─────────────────────────────────────────────┐
+  │ Repository::getXxxForQuery(Query)                          │
+  │   └── getQueryBuilderForQuery() → Query::execute()        │
+  └────────────────────────────────────────────────────────────┘
+    │
+    ▼
+  ┌─ 分页型 ───────────────┐  ┌─ 全量型 ───────────────┐
+  │ Pagination(Pagerfanta) │  │ Entity[] (实体数组)     │
+  │  setMaxPerPage /       │  │                         │
+  │  setCurrentPage        │  │                         │
+  └────────────────────────┘  └─────────────────────────┘
     │
     ▼
 ViewHandler::handle(View $view)
@@ -47,8 +55,8 @@ ViewHandler::handle(View $view)
 
 **入口：** [BaseApiController::prepareQuery()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/BaseApiController.php#L62-L112)
 
-| 参数名 | 类型 | 默认值 | 规则 | 代码位置 |
-|--------|------|--------|------|---------|
+| 参数名 | 类型 | BaseQuery 默认值 | 规则 | 代码位置 |
+|--------|------|-----------------|------|---------|
 | `page` | int | 1 | `> 0`，仅当数字时生效 | [BaseApiController.php#L76-L81](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/BaseApiController.php#L76-L81) |
 | `size` | int | 50 | `< 1` → 50；`> 500` → 500 (MAX_PAGE_SIZE) | [BaseApiController.php#L83-L95](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/BaseApiController.php#L83-L95) |
 | `order` | string | ASC | 仅接受 `ASC` / `DESC` | [BaseApiController.php#L97-L102](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/BaseApiController.php#L97-L102) |
@@ -56,15 +64,16 @@ ViewHandler::handle(View $view)
 
 > **注意：** `orderBy` 的合法性校验不在通用层，而是在各 Controller 的 `@Rest\QueryParam` 注解 `requirements` 字段中，以及各 Repository 的 `getQueryBuilderForQuery()` 的 `switch` 分支中做字段映射（不在白名单中的列会默认加实体别名前缀，可能产生 DQL 错误）。
 
-参数解析的存储目标是 [BaseQuery](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/BaseQuery.php) 对象：
+参数解析的存储目标是 [BaseQuery](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/BaseQuery.php) 对象。**各 Query 子类通过 `setDefaults()` 覆盖默认值**，BaseQuery 中的原始默认值仅作为未覆盖时的后备：
 
-```php
-// BaseQuery 内部字段
-private int $page = 1;
-private int $pageSize = self::DEFAULT_PAGESIZE;  // 50
-private string $orderBy = 'id';
-private string $order = self::ORDER_ASC;         // ASC
-```
+| Query 子类 | orderBy 默认 | order 默认 | 来源 |
+|-----------|-------------|-----------|------|
+| `BaseQuery` | `id` | `ASC` | [BaseQuery.php#L31-L37](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/BaseQuery.php#L31-L37) |
+| `TimesheetQuery` | `begin` | `DESC` | [TimesheetQuery.php#L57-L58](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/TimesheetQuery.php#L57-L58) |
+| `UserQuery` | `username` | `ASC` | [UserQuery.php#L37](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/UserQuery.php#L37) |
+| `ProjectQuery` | `name` | `ASC` | 继承自 ActivityQuery |
+| `ActivityQuery` | `name` | `ASC` | [ActivityQuery.php#L51](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/ActivityQuery.php#L51) |
+| `CustomerQuery` | `name` | `ASC` | 同上 |
 
 ### 2.2 FOSRestBundle ParamFetcher 注解
 
@@ -81,7 +90,24 @@ private string $order = self::ORDER_ASC;         // ASC
 - `nullable: true`：未传则为 null
 - `map: true`：用于数组参数，如 `users[]=1&users[]=2`
 
-### 2.3 业务过滤参数的手动解析
+### 2.3 参数校验的层级关系
+
+`page` 和 `size` 参数在分页型端点中经历**双层校验**：
+
+```
+第一层：ParamFetcher 注解层（请求进入 Controller 之前）
+  ├── requirements: '\d+'       → 非数字格式直接 400 BadRequestHttpException
+  └── strict: true              → 不满足 requirements 时立即拒绝
+        │
+        ▼
+第二层：prepareQuery() 业务层（Controller 内部）
+  ├── page: is_numeric() + > 0  → 非正整数则忽略（不报错，使用默认值 1）
+  └── size: 1 <= size <= 500    → < 1 回退到 50，> 500 截断到 500
+```
+
+> **关键区分：** `orderBy` 的校验**只**在注解层（`requirements` 正则白名单），`prepareQuery()` 不做校验（直接透传非空字符串）。这意味着全量型端点如果没声明 `orderBy` 的 `requirements`，恶意输入会直接传入 DQL。
+
+### 2.4 业务过滤参数的手动解析
 
 在 `prepareQuery()` 之后，各 Controller 的 `cgetAction()` 会**手动**解析业务特定参数并设置到具体 Query 对象中。以 `TimesheetController` 为例：
 
@@ -107,7 +133,7 @@ $term = $paramFetcher->get('term');
 $query->setSearchTerm(new SearchTerm($term));
 ```
 
-### 2.4 搜索词解析：SearchTerm
+### 2.5 搜索词解析：SearchTerm
 
 [SearchTerm](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Utils/SearchTerm.php) 将用户输入的搜索字符串按**空格**切分，并解析每个部分：
 
@@ -128,24 +154,29 @@ BaseQuery (src/Repository/Query/BaseQuery.php)
     ├── 通用字段：searchTerm, currentUser, teams, bookmark
     ├── VisibilityInterface + VisibilityTrait (可见性过滤)
     │
-    ├── TimesheetQuery (timesheets)
-    ├── UserQuery (users)
-    ├── ProjectQuery (projects)
     ├── CustomerQuery (customers)
-    ├── ActivityQuery (activities)
-    └── ...
+    │   └── ProjectQuery (projects)
+    │       └── ActivityQuery (activities)
+    │           └── TimesheetQuery (timesheets)
+    └── UserQuery (users)
 ```
 
-每个具体 Query 子类在构造函数中通过 `setDefaults()` 声明自己的默认值和支持的字段（用于表单重置、书签比较等）。例如 [UserQuery](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/UserQuery.php#L34-L43)：
+每个具体 Query 子类在构造函数中通过 `setDefaults()` 声明自己的默认值和支持的字段（用于表单重置、书签比较等）。例如 [TimesheetQuery](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/TimesheetQuery.php#L53-L68)：
 
 ```php
-public function __construct()
+public function __construct(bool $resetTimes = true)
 {
+    parent::__construct();  // 调用 ActivityQuery → BaseQuery
     $this->setDefaults([
-        'orderBy' => 'username',
-        'visibility' => VisibilityInterface::SHOW_VISIBLE,
-        'systemAccount' => null,
-        // ...
+        'order' => self::ORDER_DESC,     // 覆盖 BaseQuery 的 ASC
+        'orderBy' => 'begin',            // 覆盖 BaseQuery 的 id
+        'dateRange' => new DateRange($resetTimes),
+        'exported' => self::STATE_ALL,
+        'state' => self::STATE_ALL,
+        'billable' => null,
+        'tags' => [],
+        'users' => [],
+        'activities' => [],
     ]);
 }
 ```
@@ -169,16 +200,9 @@ switch ($query->getOrderBy()) {
 $qb->addOrderBy($orderBy, $query->getOrder());
 ```
 
-**步骤 2：权限 + 用户过滤**
+**步骤 2：用户 ID 过滤 + teamlead 自动团队注入**
 
-```php
-// 合并显式用户 + 团队用户 + 自身兜底
-$user = [...$query->getUser(), ...$query->getUsers(), ...$teamMembers, ...$currentUserFallback];
-$userIds = array_unique(array_map(fn($u) => $u->getId(), $user));
-if (count($userIds) > 0) {
-    $qb->andWhere($qb->expr()->in('t.user', $userIds));
-}
-```
+（详见 [§八](#八timesheet-用户过滤与-teamlead-自动团队注入) 专题分析）
 
 **步骤 3：业务条件（时间、状态、关联实体）**
 
@@ -200,7 +224,11 @@ $qb->andWhere($qb->expr()->in('t.activity', ':activity'))->setParameter('activit
 $qb->andWhere($qb->expr()->isMemberOf(':tags', 't.tags'))->setParameter('tags', $tags);
 ```
 
-**步骤 4：搜索词注入（SearchHelper）**
+**步骤 4：权限过滤（项目与客户 team 双重过滤）**
+
+（详见 [§九](#九项目与客户-team-双重过滤逻辑) 专题分析）
+
+**步骤 5：搜索词注入（SearchHelper）**
 
 通过 [SearchHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Search/SearchHelper.php) + [SearchConfiguration](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Search/SearchConfiguration.php)：
 
@@ -220,15 +248,15 @@ $helper->addSearchTerm($qb, $query);
 3. 字段限定词（meta 字段）：`LEFT JOIN` 关联的 meta 表，按 name+value 过滤
 4. 排除词：`OR (field IS NULL OR field NOT LIKE :x)`
 
-**步骤 5：按需 JOIN 关联表**
+**步骤 6：按需 JOIN 关联表**
 
-基于前面标记的 `$requiresProject / $requiresCustomer / $requiresActivity` 标志：
+基于前面标记的 `$requiresProject / $requiresCustomer / $requiresActivity` 和 `$requiresTeams`（权限过滤返回值）标志：
 
 ```php
-if ($requiresCustomer || $requiresProject) {
+if ($requiresCustomer || $requiresProject || $requiresTeams) {
     $qb->leftJoin('t.project', 'p');
 }
-if ($requiresCustomer) {
+if ($requiresCustomer || $requiresTeams) {
     $qb->leftJoin('p.customer', 'c');
 }
 if ($requiresActivity) {
@@ -241,7 +269,7 @@ if ($requiresActivity) {
 | 特性 | UserRepository | TimesheetRepository |
 |------|---------------|---------------------|
 | orderBy 映射 | 简单，一律加 `u.` 前缀 | 支持 project/customer/activity，需 JOIN |
-| 权限策略 | `addPermissionCriteria()`：管理员通看，团队组长看成员，始终包含自己 | 通过 `currentUser + teams + users` 合并 userIds 做 IN 过滤 |
+| 权限策略 | `addPermissionCriteria()`：管理员通看，团队组长看成员，始终包含自己 | 两层：① userIds IN 过滤 ② 项目+客户 team 双重过滤 |
 | 搜索字段 | alias, title, accountNumber, email, username + UserPreference | description + TimesheetMeta |
 | count 写法 | `countDistinct('u.id')` | `count('t')` |
 
@@ -336,14 +364,12 @@ public function __construct(AdapterInterface $adapter, ?BaseQuery $query = null)
     }
 
     // 仅非 API 调用时，越界页自动规范化（如第 999/10 页 → 自动改为第 10 页）
-    // API 调用时保留原始越界行为 → Pagerfanta 抛 NotValidCurrentPageException
+    // API 调用时保留原始越界行为 → 触发 404 异常链
     if ($query === null || !$query->isApiCall()) {
         $this->setNormalizeOutOfRangePages(true);
     }
 }
 ```
-
-**关键行为：** 当 `BaseApiController::prepareQuery()` 标记 `$query->setIsApiCall(true)` 后，越界页（如请求第 100 页但只有 10 页）不会自动规范化，而是由 Pagerfanta 抛出异常 → Symfony 转为 404 响应。这与 `#[Rest\QueryParam(name: 'page', ...)]` 的文档描述一致。
 
 ### 5.2 ViewHandler 响应头注入
 
@@ -397,33 +423,311 @@ X-Per-Page: 50
 
 Kimai 实际存在两种列表端点，需**注意区分**：
 
-| 模式 | 示例 | 返回类型 | 分页头 | 核心方法 |
-|------|------|---------|--------|---------|
-| **A. 完整分页型** | `GET /api/timesheets` | `Pagination` | ✅ `X-Page` 等 | `Repository::getPagerfantaForQuery()` |
-| **B. 全量列表型** | `GET /api/users` | `array` (实体数组) | ❌ 无 | `Repository::getUsersForQuery()` / `findBy()` |
+| 模式 | 端点 | 调用 prepareQuery | Repository 方法 | 返回类型 | 分页头 |
+|------|------|-------------------|-----------------|---------|--------|
+| **A. 完整分页型** | `/api/timesheets` | ✅ 是 | `getPagerfantaForQuery()` | `Pagination` | ✅ `X-Page` 等 |
+| **B. 全量列表型** | `/api/users` | ❌ 否 | `getUsersForQuery()` | `User[]` | ❌ 无 |
+| **B. 全量列表型** | `/api/projects` | ❌ 否 | `getProjectsForQuery()` | `Project[]` | ❌ 无 |
+| **B. 全量列表型** | `/api/customers` | ❌ 否 | `getCustomersForQuery()` | `Customer[]` | ❌ 无 |
+| **B. 全量列表型** | `/api/activities` | ✅ 是 | `getActivitiesForQuery()` | `Activity[]` | ❌ 无 |
 
-**UserController::cgetAction()** 目前使用的是**模式 B**（全量列表型）：
+> **关键发现：** 当前**仅 `/api/timesheets`** 使用完整分页模式。其他端点即使声明了 `page`/`size` 参数（如 ActivityController 调用了 `prepareQuery()`），最终也调用的是全量列表方法 `getXxxForQuery()`，分页参数实际被忽略。
+
+**UserController::cgetAction()** 完全不调用 `prepareQuery()`，也未声明 `page`/`size` 的 `#[Rest\QueryParam]` 注解：
 
 ```php
-// UserController L88-L89
+// UserController L65-L89 — 无 page/size 注解，无 prepareQuery 调用
+$query = new UserQuery();
+$query->setCurrentUser($this->getUser());
+// ... 手动解析 visible/order/orderBy/term ...
 $query->setIsApiCall(true);
-$data = $this->repository->getUsersForQuery($query);  // 返回 User[]
-$view = new View($data, 200);                         // 直接作为数组序列化
+$data = $this->repository->getUsersForQuery($query);  // 全量返回 User[]
 ```
 
-这意味着 `/api/users` 端点**不支持** `page` 和 `size` 参数，即使传了也会被忽略。而 `/api/timesheets`、`/api/projects` 等端点则使用**模式 A**，支持完整分页。
+**ActivityController::cgetAction()** 虽然调用了 `prepareQuery()`（会将 page/size 写入 Query），但最终调用 `getActivitiesForQuery()` 返回全量数组，分页参数被静默丢弃。
 
-> **设计意图推测：** 用户/活动等实体数据量通常较小（几十到几百条），直接全量返回更方便前端下拉选择；而 Timesheet 可能有数十万条，必须分页。这是 API 设计上的刻意不对称，而非遗漏。
+> **设计意图推测：** 用户/项目/客户/活动等实体数据量通常较小（几十到几百条），直接全量返回更方便前端下拉选择；而 Timesheet 可能有数十万条，必须分页。这是 API 设计上的刻意不对称，而非遗漏。
 
 ---
 
-## 七、关键文件速查表
+## 七、分页越界 404 异常处理路径
+
+### 7.1 完整异常链
+
+当分页型端点（仅 `/api/timesheets`）请求了越界页码时，异常处理路径如下：
+
+```
+① Pagerfanta::getCurrentPageResults()
+    │
+    │  内部调用 Adapter::getSlice($offset, $length)
+    │  但在此之前检查 currentPage 是否 > maxPages
+    │
+    ▼
+② Pagerfanta 抛出 OutOfRangeCurrentPageException
+    │  "Page 100 does not exist (max: 10)"
+    │
+    ▼
+③ Symfony Kernel 异常事件分发
+    │
+    ▼
+④ PagerfantaExceptionSubscriber::onCoreException()  [优先级 1]
+    │  检测到 OutOfRangeCurrentPageException
+    │  替换为 NotFoundHttpException（保留原始 message 和 code）
+    │  代码位置: src/EventSubscriber/PagerfantaExceptionSubscriber.php
+    │
+    ▼
+⑤ FOSRestBundle ExceptionListener 处理
+    │  读取 fos_rest.yaml 中的 codes 映射:
+    │  NotFoundHttpException → 404
+    │  代码位置: config/packages/fos_rest.yaml L27
+    │
+    ▼
+⑥ 最终响应: HTTP 404 + JSON 错误体
+```
+
+### 7.2 关键组件
+
+**[PagerfantaExceptionSubscriber](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/EventSubscriber/PagerfantaExceptionSubscriber.php)** 拦截两种 Pagerfanta 异常：
+
+| Pagerfanta 异常 | 触发场景 | 转换结果 |
+|-----------------|---------|---------|
+| `OutOfRangeCurrentPageException` | page > 总页数 | `NotFoundHttpException` → 404 |
+| `NotValidMaxPerPageException` | size ≤ 0 | `NotFoundHttpException` → 404 |
+
+> **注释原文**（[PagerfantaExceptionSubscriber.php#L20-L23](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/EventSubscriber/PagerfantaExceptionSubscriber.php#L20-L23)）：
+> "Catches Pagerfanta Exceptions and converts them to 'normal' Http Exceptions with status code 404. This was mainly done to convert the 500 to 404 HTTP response code. This prevents also the need to register them in fos_rest.yaml for the API."
+
+### 7.3 为什么 API 调用不自动规范化越界页
+
+[Pagination](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Utils/Pagination.php#L27-L29) 中：
+
+```php
+// 仅非 API 调用时，越界页自动规范化
+if ($query === null || !$query->isApiCall()) {
+    $this->setNormalizeOutOfRangePages(true);
+}
+```
+
+**Web 端**（`isApiCall=false`）：越界页自动重定向到最后一页（用户体验友好）
+**API 端**（`isApiCall=true`）：越界页直接 404（符合 REST 语义——资源不存在）
+
+### 7.4 与 ParamFetcher 注解的协作
+
+`page` 参数注解 `requirements: '\d+'` + `strict: true` 保证了非数字值（如 `page=abc`）在注解层就被拦截为 400。只有通过了注解校验的数字值才会到达 Pagerfanta，此时越界才会触发上述 404 路径。
+
+---
+
+## 八、Timesheet 用户过滤与 teamlead 自动团队注入
+
+### 8.1 用户 ID 收集的三路来源
+
+[TimesheetRepository::getQueryBuilderForQuery()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/TimesheetRepository.php#L559-L592) 中的用户过滤并非简单的 `WHERE user_id = X`，而是多路来源合并后做 `IN` 过滤：
+
+```
+来源 1: $query->getUser()          → 显式指定的单一用户（TimesheetQuery::timesheetUser）
+来源 2: $query->getUsers()         → API 中通过 users[]/user 参数添加的用户列表
+来源 3: $query->getTeams()         → 团队成员展开（每个 team → 所有 user）
+来源 4: 自动兜底                   → 当前用户自身（当以上均为空时触发）
+```
+
+代码流程（[L559-L592](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/TimesheetRepository.php#L559-L592)）：
+
+```php
+$user = [];
+
+// 来源 1: 显式单一用户
+if (null !== $query->getUser()) {
+    $user[] = $query->getUser();
+}
+
+// 来源 2: 附加用户列表
+$user = array_merge($user, $query->getUsers());
+
+// 来源 4: 自动兜底逻辑（当来源 1+2 均为空时触发）
+if (count($user) === 0 && null !== ($currentUser = $query->getCurrentUser()) && !$currentUser->canSeeAllData()) {
+    $user[] = $currentUser;  // 确保当前用户至少能看到自己的工时
+
+    // 自动注入 teamlead 团队
+    if (!$query->hasTeams()) {
+        foreach ($currentUser->getTeams() as $team) {
+            if ($currentUser->isTeamleadOf($team)) {
+                $query->addTeam($team);  // 副作用：修改 Query 对象
+            }
+        }
+    }
+}
+
+// 来源 3: 展开团队成员
+foreach ($query->getTeams() as $team) {
+    foreach ($team->getUsers() as $teamUser) {
+        $user[] = $teamUser;
+    }
+}
+
+$userIds = array_unique(array_map(fn($u) => $u->getId(), $user));
+if (count($userIds) > 0) {
+    $qb->andWhere($qb->expr()->in('t.user', $userIds));
+}
+```
+
+### 8.2 teamlead 自动团队注入的触发条件
+
+**四个条件必须全部满足**（[L566-L577](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/TimesheetRepository.php#L566-L577)）：
+
+| # | 条件 | 代码 | 含义 |
+|---|------|------|------|
+| 1 | 无显式用户 | `count($user) === 0` | API 调用者未指定 user/users 参数 |
+| 2 | 当前用户存在 | `null !== $currentUser` | prepareQuery() 已设置 currentUser |
+| 3 | 非管理员 | `!$currentUser->canSeeAllData()` | 管理员不需要团队过滤 |
+| 4 | 无显式团队 | `!$query->hasTeams()` | API 调用者未指定 teams 参数 |
+
+当四个条件均满足时，遍历当前用户所在的所有团队，如果他是某个团队的 teamlead，则将该团队**注入到 Query 对象中**（注意：这是对 Query 的副作用修改，后续该 Query 的 `getTeams()` 会包含注入的团队）。
+
+### 8.3 注入的设计意图
+
+普通用户（非 teamlead）的团队在来源 3 的团队展开中不会贡献额外用户（因为团队用户已包含自身）。但如果用户是 teamlead，他应该能看到其团队下**所有成员**的工时，而不仅仅是自己的。
+
+如果跳过自动注入，来源 1+2 为空时来源 3 也为空（`!$query->hasTeams()`），最终只有当前用户自身在 `$userIds` 中，teamlead 将无法看到团队成员的工时——这显然不符合权限模型。
+
+### 8.4 管理员的短路路径
+
+如果 `$currentUser->canSeeAllData()` 为 true（即 `isSuperAdmin()` 或拥有 `view_all_data` 权限），整个自动兜底块被跳过：
+- `$user` 数组保持为空
+- `$userIds` 为空
+- `count($userIds) > 0` 为 false，不添加 `WHERE t.user IN (...)` 条件
+- 结果：**管理员看到所有用户的工时**，无用户维度过滤
+
+---
+
+## 九、项目与客户 team 双重过滤逻辑
+
+### 9.1 问题背景
+
+Kimai 中项目（Project）和客户（Customer）都可以关联团队（Team）。一个工时记录（Timesheet）通过 project → customer 形成关联链。权限过滤需要**同时**检查：
+
+1. 用户是否有权访问该项目（项目的团队包含用户，或项目无团队）
+2. 用户是否有权访问该客户（客户的团队包含用户，或客户无团队）
+
+只有**两者都满足**时，工时记录才可见。
+
+### 9.2 TimesheetRepository 的实现
+
+[TimesheetRepository::addPermissionCriteria()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/TimesheetRepository.php#L404-L446)：
+
+```php
+private function addPermissionCriteria(QueryBuilder $qb, ?User $user = null, array $teams = []): bool
+{
+    // 短路 1: 无用户且无团队 → 不过滤
+    if (null === $user && empty($teams)) {
+        return false;
+    }
+
+    // 短路 2: 管理员 → 不过滤
+    if (null !== $user && $user->canSeeAllData()) {
+        return false;
+    }
+
+    // 合并用户所在团队
+    if (null !== $user) {
+        $teams = array_merge($teams, $user->getTeams());
+    }
+
+    // 分支 A: 用户无任何团队 → 只看"无团队保护"的项目和客户
+    if (empty($teams)) {
+        $qb->andWhere('SIZE(c.teams) = 0');
+        $qb->andWhere('SIZE(p.teams) = 0');
+        return true;  // 需要 JOIN customer 和 project
+    }
+
+    // 分支 B: 用户有团队 → 双重 OR 过滤
+    $orProject = $qb->expr()->orX(
+        'SIZE(p.teams) = 0',                            // 项目无团队 → 公开，所有人可见
+        $qb->expr()->isMemberOf(':teams', 'p.teams')    // 项目团队包含用户所在团队
+    );
+    $qb->andWhere($orProject);
+
+    $orCustomer = $qb->expr()->orX(
+        'SIZE(c.teams) = 0',                            // 客户无团队 → 公开
+        $qb->expr()->isMemberOf(':teams', 'c.teams')    // 客户团队包含用户所在团队
+    );
+    $qb->andWhere($orCustomer);
+
+    $ids = array_values(array_unique(array_map(fn(Team $team) => $team->getId(), $teams)));
+    $qb->setParameter('teams', $ids);
+
+    return true;  // 需要 JOIN customer 和 project
+}
+```
+
+### 9.3 三层决策树
+
+```
+addPermissionCriteria($qb, $user, $teams)
+│
+├── 无用户且无团队 → return false（不过滤，不需要 JOIN）
+│
+├── 管理员 (canSeeAllData) → return false（不过滤，不需要 JOIN）
+│
+├── 合并用户团队后，teams 仍为空
+│   └── WHERE SIZE(c.teams) = 0 AND SIZE(p.teams) = 0
+│       → 只看"公开"项目和"公开"客户
+│       → return true（需要 JOIN p 和 c）
+│
+└── 合并用户团队后，teams 非空
+    └── WHERE (SIZE(p.teams)=0 OR p.teams MEMBER OF :teams)
+          AND (SIZE(c.teams)=0 OR c.teams MEMBER OF :teams)
+        → 项目可见 = 公开 OR 团队匹配
+        → 客户可见 = 公开 OR 团队匹配
+        → 两者都必须满足（AND）
+        → return true（需要 JOIN p 和 c）
+```
+
+### 9.4 `SIZE()` 与 `IS MEMBER OF` 的 DQL 语义
+
+- `SIZE(p.teams) = 0`：项目的 teams 集合大小为 0，即"无团队保护"（公开项目）
+- `:teams IS MEMBER OF p.teams`：参数中的任意 team ID 存在于项目的 teams 集合中
+
+`IS MEMBER OF` 在 DQL 中等价于 `EXISTS (SELECT 1 FROM project_team pt WHERE pt.project_id = p.id AND pt.team_id IN (:teams))`，是一个子查询存在性检查。
+
+### 9.5 返回值的 JOIN 触发作用
+
+`addPermissionCriteria()` 返回 `bool`，调用方据此决定是否需要 LEFT JOIN：
+
+```php
+// TimesheetRepository::getQueryBuilderForQuery() L649-L664
+$requiresTeams = $this->addPermissionCriteria($qb, $query->getCurrentUser(), $query->getTeams());
+
+if ($requiresCustomer || $requiresProject || $requiresTeams) {
+    $qb->leftJoin('t.project', 'p');    // 需要项目表
+}
+if ($requiresCustomer || $requiresTeams) {
+    $qb->leftJoin('p.customer', 'c');   // 需要客户表
+}
+```
+
+当权限过滤返回 `false` 时，如果不因其他原因需要 JOIN，查询将只访问 `t` 表，性能更优。
+
+### 9.6 各 Repository 的 team 过滤对比
+
+| Repository | 过滤维度 | 无团队时的条件 | 有团队时的条件 |
+|-----------|---------|--------------|--------------|
+| **TimesheetRepository** | 项目 + 客户 | `SIZE(c.teams)=0 AND SIZE(p.teams)=0` | `(SIZE(p.teams)=0 OR :teams MEMBER OF p.teams) AND (SIZE(c.teams)=0 OR :teams MEMBER OF c.teams)` |
+| **ProjectRepository** | 项目 + 客户 | 同 Timesheet | 同 Timesheet |
+| **CustomerRepository** | 客户 | `SIZE(c.teams)=0` | `SIZE(c.teams)=0 OR :teams MEMBER OF c.teams` |
+| **ActivityRepository** | 活动 + 项目 + 客户 | `SIZE(a.teams)=0 AND SIZE(p.teams)=0 AND SIZE(c.teams)=0` | `(SIZE(a.teams)=0 OR :teams MEMBER OF a.teams) AND (SIZE(p.teams)=0 OR :teams MEMBER OF p.teams) AND (SIZE(c.teams)=0 OR :teams MEMBER OF c.teams)` |
+
+> **规律：** 每个 Repository 过滤的是**自身实体 + 所有祖先实体的 team**。Timesheet 本身无 team 字段，所以只过滤 project + customer。Activity 是三重过滤（自身 + project + customer），但 `globalsOnly=true` 时只过滤自身。
+
+---
+
+## 十、关键文件速查表
 
 | 角色 | 文件 |
 |------|------|
 | API 控制器基类 | [BaseApiController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/BaseApiController.php) |
 | 分页参数/排序参数解析 | [BaseApiController::prepareQuery()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/BaseApiController.php#L62-L112) |
 | 查询基类（所有 Query 的父类） | [BaseQuery.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/BaseQuery.php) |
+| 工时查询（默认 orderBy=begin, order=DESC） | [TimesheetQuery.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/TimesheetQuery.php) |
 | 搜索词解析 | [SearchTerm.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Utils/SearchTerm.php) |
 | 搜索条件构造 | [SearchHelper.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Search/SearchHelper.php) |
 | 搜索配置（可搜索字段、meta 字段映射） | [SearchConfiguration.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Search/SearchConfiguration.php) |
@@ -432,6 +736,13 @@ $view = new View($data, 200);                         // 直接作为数组序�
 | 带 Loader 的分页器 | [LoaderQueryPaginator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Paginator/LoaderQueryPaginator.php) |
 | 简单查询分页器 | [QueryPaginator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Paginator/QueryPaginator.php) |
 | 响应头注入 | [ViewHandler.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/ViewHandler.php) |
+| 分页越界异常处理 | [PagerfantaExceptionSubscriber.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/EventSubscriber/PagerfantaExceptionSubscriber.php) |
+| FOSRestBundle 异常码映射配置 | [fos_rest.yaml](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/config/packages/fos_rest.yaml) |
+| Timesheet teamlead 自动注入 + team 双重过滤 | [TimesheetRepository::getQueryBuilderForQuery()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/TimesheetRepository.php#L525-L676) |
+| Timesheet 权限过滤（项目+客户 team） | [TimesheetRepository::addPermissionCriteria()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/TimesheetRepository.php#L404-L446) |
+| Project 权限过滤（项目+客户 team） | [ProjectRepository::getPermissionCriteria()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/ProjectRepository.php#L101-L145) |
+| Customer 权限过滤（客户 team） | [CustomerRepository::getPermissionCriteria()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/CustomerRepository.php#L95-L132) |
+| Activity 权限过滤（活动+项目+客户 team） | [ActivityRepository::getPermissionCriteria()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/ActivityRepository.php#L95-L150) |
 | 完整分页端点示例 | [TimesheetController::cgetAction()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/TimesheetController.php#L73-L247) |
 | 全量列表端点示例 | [UserController::cgetAction()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/UserController.php#L55-L100) |
 | 完整分页 Repository 示例 | [TimesheetRepository.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/TimesheetRepository.php#L448-L676) |
