@@ -92,23 +92,35 @@ final class Versioned
 
 这是最容易踩坑的地方：**ModifiedSubscriber 修改了 modifiedAt，但故意不调用 recomputeSingleEntityChangeSet**，它依赖后续的 TimesheetSubscriber 来完成 recompute。
 
+⚠️ **重要修正**：`recomputeSingleEntityChangeSet()` **不是与数据库值对比**，而是将 PHP 对象的当前属性值与 **UnitOfWork 内部保存的原始快照（original entity data snapshot）** 对比。这个快照是在实体被加载到内存（find/refresh）或第一次被 persist 时保存的。因此：
+- 如果在 flush 之前有其他代码通过 UPDATE SQL 直接修改了数据库值，但没有刷新实体，recompute 不会感知到这些数据库层面的变更
+- recompute 只反映 PHP 内存中对象的状态变化与原始快照的差异
+
 完整时序（以 Timesheet UPDATE 为例）：
 
 ```
+实体加载/创建时
+   └── UnitOfWork 保存一份 $originalEntityData 快照（PHP 数组形式）
+        ↓
 flush() 触发 onFlush
    ↓
 [1] ModifiedSubscriber (priority=60) 先执行
    ├── 遍历 getScheduledEntityUpdates()
    ├── 对 Timesheet 调用 setModifiedAt($now)        ← ✅ PHP 对象属性已改
    └── ❗ 不调用 recomputeSingleEntityChangeSet()   ← ❌ ChangeSet 未更新
+                                                      UoW 内 $originalEntityData
+                                                      依然是加载时的旧快照
    ↓
 [2] TimesheetSubscriber (priority=50) 后执行
-   ├── 调用 getEntityChangeSet()                   ← 拿到的是【原始用户变更】，不含 modifiedAt
+   ├── 调用 getEntityChangeSet()                   ← 对比对象 vs $originalEntityData
+   ├── 拿到的是【原始用户变更】，不含 modifiedAt
    ├── 把 changeSet 传给所有 Calculator 执行        ← Calculator 基于原始变更计算
    ├── Calculator 修改 rate/duration/fixedRate 等字段
-   └── ✅ 调用 recomputeSingleEntityChangeSet()     ← 重新对比对象状态与DB值，
-                                                       此时 modifiedAt + 计算字段
-                                                       都会被纳入最终 ChangeSet
+   └── ✅ 调用 recomputeSingleEntityChangeSet()     ← 重新对比：
+                                                       当前对象状态  vs  $originalEntityData
+                                                       (modifiedAt + 计算字段) 都会
+                                                       出现在新的 ChangeSet 中
+                                                       同时更新 UoW 内部快照
    ↓
 [3] 审计订阅器 (priority<50) 最后执行
    └── 调用 getEntityChangeSet()                   ← 拿到【最终完整变更集】
@@ -132,16 +144,18 @@ flush() 触发 onFlush
 
 #### 3.4.1 实体时间字段全景
 
-| 实体 | `ModifiedAt` 接口 | `CreatedAt` 接口 | `createdAt` 字段 | `modifiedAt` 字段 | 时间字段赋值方式 |
-|------|-------------------|------------------|-----------------|------------------|----------------|
-| `Timesheet` | ✅ 是 | ❌ 否 | ❌ 无 | ✅ 有 | ModifiedSubscriber (onFlush) |
-| `Project` | ❌ 否 | ✅ 是 | ✅ 有 | ❌ 无 | 构造函数中手动设置 |
-| `Customer` | ❌ 否 | ✅ 是 | ✅ 有 | ❌ 无 | 构造函数中手动设置 |
-| `Activity` | ❌ 否 | ✅ 是 | ✅ 有 | ❌ 无 | 构造函数中手动设置 |
-| `Invoice` | ❌ 否 | ❌ 否 | ✅ 有 | ❌ 无 | 业务代码手动设置（from InvoiceDate） |
-| `User` | ❌ 否 | ❌ 否 | ❌ 无 | ❌ 无 | 无自动时间戳 |
+| 实体 | `ModifiedAt` 接口 | `CreatedAt` 接口 | `createdAt` 字段 | `modifiedAt` 字段 | 其他时间字段 | 时间字段赋值方式 |
+|------|-------------------|------------------|-----------------|------------------|-------------|----------------|
+| `Timesheet` | ✅ 是 | ❌ 否 | ❌ 无 | ✅ 有 | - | ModifiedSubscriber (onFlush) |
+| `Project` | ❌ 否 | ✅ 是 | ✅ 有 | ❌ 无 | - | 构造函数中手动设置 |
+| `Customer` | ❌ 否 | ✅ 是 | ✅ 有 | ❌ 无 | - | 构造函数中手动设置 |
+| `Activity` | ❌ 否 | ✅ 是 | ✅ 有 | ❌ 无 | - | 构造函数中手动设置 |
+| `Invoice` | ❌ 否 | ❌ 否 | ✅ 有 | ❌ 无 | invoiceDate, dueDate | 业务代码手动设置（从 invoiceDate 派生） |
+| `User` | ❌ 否 | ❌ 否 | ❌ 无 | ❌ 无 | **registeredAt**（registration_date）、lastLogin | **registeredAt**: 构造函数中 `new DateTime()`；**lastLogin**: 登录事件监听器设置 |
 
 > **关于 Invoice 的说明**：Invoice 实体有 `created_at` 数据库字段（[Invoice.php L80](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/Entity/Invoice.php#L80)），但**不实现 `CreatedAt` 接口**，因此 ModifiedSubscriber **不会** 自动为其赋值。它的 createdAt 由业务逻辑在创建发票时从 `invoiceDate` 手动设置。
+
+> **关于 User registeredAt 的说明**：User 实体虽然不实现 `CreatedAt` 接口，但有独立的 `registeredAt` 字段（数据库列名 `registration_date`，[User.php L92-L94](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/Entity/User.php#L92-L94)）。该字段在 User 构造函数中被设置为 `new DateTime()`（[User.php L245-L250](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/Entity/User.php#L245-L250)），无需 ModifiedSubscriber 干预。User 还有 `last_login` 字段，由安全登录事件监听器在用户认证成功时设置，不经过 onFlush。
 
 #### 3.4.2 非 Timesheet 实体的 ChangeSet 是稳定的
 
@@ -306,6 +320,106 @@ foreach ($uow->getScheduledEntityUpdates() as $entity) {
 > - 要记录「用户真实意图」→ priority > 60
 > - 要记录「最终持久化状态」→ priority < 50
 
+### 4.5 集合关联变更（ManyToMany）的完整业务路径
+
+除了标量字段变更外，实体之间的关联（尤其是 ManyToMany 集合）是审计时非常容易遗漏的部分。Kimai 中最典型的例子是 **Timesheet ↔ Tag 关联**。
+
+#### 4.5.1 映射关系定义
+
+[Timesheet.php L205-L212](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/Entity/Timesheet.php#L205-L212)：
+```php
+/**
+ * @var Collection<Tag>
+ */
+#[ORM\JoinTable(name: 'kimai2_timesheet_tags')]
+#[ORM\JoinColumn(name: 'timesheet_id', referencedColumnName: 'id', onDelete: 'CASCADE')]
+#[ORM\InverseJoinColumn(name: 'tag_id', referencedColumnName: 'id', onDelete: 'CASCADE')]
+#[ORM\ManyToMany(targetEntity: Tag::class, cascade: ['persist'])]
+private Collection $tags;
+```
+
+- 使用独立关联表 `kimai2_timesheet_tags`
+- `ManyToMany` 关系，**非 owning side / owning side 均由 Timesheet 侧管理**
+- 级联 `persist`（Tag 不存在时自动创建，不会自动删除 Tag 本身）
+- `onDelete: CASCADE`（删除 Timesheet 或 Tag 时，关联表行自动由数据库删除）
+
+#### 4.5.2 业务层操作方式
+
+[Timesheet.php L416-L432](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/Entity/Timesheet.php#L416-L432)：
+
+```php
+public function addTag(Tag $tag): Timesheet
+{
+    if ($this->tags->contains($tag)) {
+        return $this;
+    }
+    $this->tags->add($tag);
+    return $this;
+}
+
+public function removeTag(Tag $tag): void
+{
+    if (!$this->tags->contains($tag)) {
+        return;
+    }
+    $this->tags->removeElement($tag);
+}
+```
+
+**关键点**：
+- 没有专门的应用层事件（如 `TimesheetTagAddedEvent`）来通知标签变更
+- 标签的增删与 Timesheet 的普通字段修改**走同一条链路**：调用 addTag/removeTag → save() → flush()
+- 因此 `TimesheetCreatePreEvent` / `TimesheetUpdatePostEvent` 等通用事件中，实体对象上已经包含了最新的标签集合状态
+- 但 `getEntityChangeSet()` **不会包含集合变更**（因为集合变更不修改实体本身的属性）
+
+#### 4.5.3 onFlush 中如何检测集合变更
+
+集合变更与标量字段变更在 UnitOfWork 中是**分开追踪**的：
+
+| 标量字段 | 集合（ManyToMany / OneToMany） |
+|---------|-------------------------------|
+| `getScheduledEntityUpdates()` | `getScheduledCollectionUpdates()` + `getScheduledCollectionDeletions()` |
+| `getEntityChangeSet()` | `$coll->getInsertDiff()` + `$coll->getDeleteDiff()` |
+
+**集合变更获取方式**：
+```php
+// 遍历更新的集合（元素被添加/删除）
+foreach ($uow->getScheduledCollectionUpdates() as $coll) {
+    $owner    = $coll->getOwner();             // 拥有集合的实体（e.g. Timesheet）
+    $field    = $coll->getMapping()['fieldName']; // 字段名（e.g. "tags"）
+    $added    = $coll->getInsertDiff();         // 本次新增的元素
+    $removed  = $coll->getDeleteDiff();         // 本次删除的元素
+    $snapshot = $coll->getSnapshot();           // flush 前的原始快照
+}
+
+// 遍历删除的集合（整个集合被清空/替换）
+foreach ($uow->getScheduledCollectionDeletions() as $coll) {
+    $owner    = $coll->getOwner();
+    $snapshot = $coll->getSnapshot();           // 被删除前的原始元素快照
+}
+```
+
+#### 4.5.4 对 Timesheet-Tag 的具体影响
+
+| 操作 | 是否触发实体 Update | 是否触发 Collection Update | 可获取的差异 |
+|------|--------------------|--------------------------|------------|
+| 修改描述 + 添加 2 个 Tag | ✅ 是 | ✅ 是 | ChangeSet: description；InsertDiff: 2 个新 Tag |
+| 只添加/删除 Tag，不修改其他字段 | ❌ **否**（实体无标量变更） | ✅ **是** | InsertDiff/DeleteDiff 中的 Tag 差异 |
+| 保存一个全新 Timesheet 并带标签 | ✅（INSERT） | ✅（Collection Updates） | getScheduledEntityInsertions + InsertDiff |
+| 删除整个 Timesheet | ✅（DELETE） | ❌ **否**（onDelete: CASCADE 由数据库直接删除关联行） | 注意：删除前必须手动快照标签，否则 onFlush 中拿不到 |
+
+> ⚠️ **审计陷阱**：如果用户**只修改了标签**（不改动描述、时间、项目等标量字段），Timesheet 实体本身不会出现在 `getScheduledEntityUpdates()` 中。如果审计订阅器只遍历 entity updates，就会漏掉标签变更。必须同时遍历 `getScheduledCollectionUpdates()` 才能完整捕获。
+
+#### 4.5.5 与 modifiedAt 的交互
+
+用户常见疑问：只 addTag/removeTag 不修改其他字段时，modifiedAt 会不会更新？
+
+**答案：会。** 原因：
+1. `ModifiedSubscriber` 只遍历 `getScheduledEntityUpdates()`，对集合变更无感知
+2. 但 Doctrine 在检测到集合变更时，会自动把 owning-side 实体**标记为 dirty**，使其进入 `getScheduledEntityUpdates()`
+3. 因此 ModifiedSubscriber 能看到 Timesheet 并调用 `setModifiedAt()`
+4. 后续 TimesheetSubscriber recompute，modifiedAt + 集合变更一起持久化
+
 ---
 
 ## 五、批量更新下的记录策略
@@ -419,18 +533,57 @@ repository->deleteMultiple($timesheets)
 | **50 ~ 60 之间**（如 55） | ❌ 不推荐 | 陷阱地带：对象已改但 ChangeSet 未更新 | 避免在这个区间插入审计订阅器 |
 | **< 50**（如 10） | 记录「最终持久化状态」 | 完整变更集（用户修改 + 系统计算 + modifiedAt）| ✅ 推荐用于数据变更审计 |
 
-### 7.2 必须订阅的事件清单
+### 7.2 必须订阅的事件清单（完整修正版）
 
-| 类别 | 事件 | 接入层级 |
-|------|------|----------|
-| **单个创建** | `TimesheetCreatePostEvent` `ProjectCreatePostEvent` `UserCreatePostEvent` ... | 应用层 EventDispatcher |
-| **单个更新** | `TimesheetUpdatePostEvent` `ProjectUpdatePostEvent` ... | 应用层 EventDispatcher |
-| **单个删除** | `TimesheetDeletePreEvent` `ProjectDeleteEvent` `UserDeletePreEvent` ... | 应用层 EventDispatcher |
-| **批量更新** | `TimesheetUpdateMultiplePostEvent` | 应用层 EventDispatcher |
-| **批量删除** | `TimesheetDeleteMultiplePreEvent` | 应用层 EventDispatcher |
-| **特殊操作** | `TimesheetStopPostEvent` `TimesheetRestartPostEvent` | 应用层 EventDispatcher |
-| **ORM 层兜底** | Doctrine `Events::onFlush` (priority < 50) | Doctrine 生命周期 |
-| **DQL 盲区** | 手动包裹 `setExported` `deleteUser` `deleteProject` `deleteCustomer` 等 | AOP/装饰 Repository |
+#### 7.2.1 创建类事件（三种语义）
+
+Kimai 的创建事件分 **三个层级**，容易混淆：
+
+| 事件类型 | 语义 | 是否已持久化 | 典型事件 | 触发位置 |
+|---------|------|-------------|---------|---------|
+| **非持久化创建事件**（"new"/"draft"） | 新建对象实例，但尚未经过校验与保存 | ❌ 未写入数据库 | `UserCreateEvent`、`ProjectCreateEvent`、`CustomerCreateEvent`、`ActivityCreateEvent`、`TeamCreateEvent`、`InvoiceCreatedEvent` | `createNewXxx()` 工厂方法中，如 [UserService.php L69](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/User/UserService.php#L69)、[TeamService.php L57](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/User/TeamService.php#L57) |
+| **Pre 创建事件** | 即将保存前，已校验通过，尚未持久化 | ❌ 未写入数据库 | `TimesheetCreatePreEvent`、`UserCreatePreEvent`、`ProjectCreatePreEvent`、`TeamCreatePreEvent` 等 | `saveNewXxx()` 中 persist 之前，如 [UserService.php L98](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/User/UserService.php#L98) |
+| **Post 创建事件** | 保存完成，已持久化 | ✅ 已写入数据库，有 ID | `TimesheetCreatePostEvent`、`UserCreatePostEvent`、`ProjectCreatePostEvent` 等 | `saveNewXxx()` 中 flush 之后，如 [UserService.php L100](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/User/UserService.php#L100) |
+
+> ⚠️ **注意**：非持久化创建事件（`XxxCreateEvent`，不带 Pre/Post）的对象可能**永远不会被保存**（如表单展示时仅用于初始化默认值）。如果审计需要只记录真正落库的创建，应订阅 **Post 创建事件**，而非非持久化创建事件。
+
+#### 7.2.2 删除类事件（三种模式）
+
+不同实体的删除事件体系**不一致**，是实现审计时最容易遗漏的：
+
+| 模式 | 代表实体 | 事件 | 是否分 Pre/Post | 携带 $replace 参数 |
+|------|---------|------|----------------|-------------------|
+| **模式 A：只有 Pre** | Timesheet | `TimesheetDeletePreEvent` | ❌ 只有 Pre，无 Post | ❌ 无 |
+| **模式 B：Pre + Delete + Post 三级** | User | `UserDeletePreEvent` → `UserDeleteEvent`（基类）→ `UserDeletePostEvent` | ✅ 有 Pre 有 Post | ✅ 有（替换用户） |
+| **模式 C：只有 Delete 一种（不分 Pre/Post）** | Project、Customer、Activity、Team、Invoice | `ProjectDeleteEvent`、`CustomerDeleteEvent`、`ActivityDeleteEvent`、`TeamDeleteEvent`、`InvoiceDeleteEvent` | ❌ 只有单一事件 | ✅ 部分有（如 Project/Customer/Activity 删除时的 replace）|
+
+代码对照：
+- **模式 B User**：[UserService.php L199-L204](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/User/UserService.php#L199-L204) — Pre + deleteUser() 真正执行 + Post
+- **模式 C Team**：[TeamService.php L112-L116](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/User/TeamService.php#L112-L116) — 只 dispatch `TeamDeleteEvent`，再调用 deleteTeam()
+
+#### 7.2.3 批量删除事件
+
+| 事件 | 说明 |
+|------|------|
+| `TimesheetDeleteMultiplePreEvent` | 批量删除 Timesheet，只有 Pre 没有 Post |
+
+> 其他实体没有 "Multiple" 批量删除事件，批量删除操作通过循环逐个删除实现。
+
+#### 7.2.4 其他业务动作事件（Timesheet 专属）
+
+| 事件 | 触发场景 |
+|------|---------|
+| `TimesheetStopPreEvent` / `TimesheetStopPostEvent` | 停止计时（打卡结束）|
+| `TimesheetRestartPreEvent` / `TimesheetRestartPostEvent` | 重启已有时间条目 |
+| `TimesheetDuplicatePreEvent` / `TimesheetDuplicatePostEvent` | 复制时间条目 |
+| `TimesheetUpdateMultiplePreEvent` / `TimesheetUpdateMultiplePostEvent` | 批量更新（价格/项目/活动等）|
+
+#### 7.2.5 ORM 层 + DQL 盲区
+
+| 类别 | 接入方式 | 说明 |
+|------|---------|------|
+| **ORM 层兜底** | Doctrine `Events::onFlush` (priority < 50) | 捕获所有 persist/flush 触发的实体与集合变更 |
+| **DQL 盲区** | 手动包裹 `setExported`、`deleteUser`、`deleteProject`、`deleteCustomer`、`deleteActivity` 等 | 绕过应用层事件与 onFlush，必须单独埋点 |
 
 ### 7.3 推荐的 onFlush 订阅器骨架（修正版）
 
@@ -534,21 +687,27 @@ final class AuditLogSubscriber implements EventSubscriber
 
 ---
 
-## 八、总结：链路直白化要点（二次修正版）
+## 八、总结：链路直白化要点（三次修正版）
 
 | 之前容易混淆的点 | 澄清结论 |
 |------------------|----------|
 | "Loggable/Versioned 为啥搜不到使用处" | 核心仅定义 Attribute，消费逻辑需插件自行实现（预留扩展点） |
 | "onFlush 中两个订阅器谁先执行" | **priority 越大越早** → `priority 60` (ModifiedSubscriber) → `priority 50` (TimesheetSubscriber) |
 | "ModifiedSubscriber 改了 modifiedAt 为什么不 recompute" | 故意不 recompute，**依赖 TimesheetSubscriber 的 recompute** 来把 modifiedAt 纳入最终变更集。这是隐式耦合。 |
+| "recomputeSingleEntityChangeSet 是跟数据库对比吗" | ❌ **不是**。只跟 **UnitOfWork 内存中的原始快照（$originalEntityData）** 对比，不读取数据库。如果外部 SQL 直接改了 DB，不刷新实体就感知不到。 |
 | "变更集三阶段对所有实体都成立吗" | ❌ **不成立**。仅 Timesheet 实体有三阶段演变。Project/Customer/Activity 等实体在 onFlush 中无人修改，ChangeSet 全程不变。 |
 | "什么 priority 能拿到完整 ChangeSet" | 对 Timesheet：必须 **< 50**，在 TimesheetSubscriber 之后执行；对其他实体：任意 priority 都一样 |
 | "priority 50~60 之间插入会怎样" | 对 Timesheet：陷阱地带（对象上 modifiedAt 已改，但 ChangeSet 中没有）；对其他实体：无影响 |
-| "所有实体都有 modifiedAt 吗" | 只有 `Timesheet` 实现了 `ModifiedAt` 接口。Project/Customer/Activity 只有 `CreatedAt`，Invoice 有 createdAt 字段但不实现接口。 |
+| "所有实体都有 modifiedAt 吗" | 只有 `Timesheet` 实现了 `ModifiedAt` 接口。Project/Customer/Activity 只有 `CreatedAt`，Invoice 有 createdAt 字段但不实现接口，**User 有独立的 registeredAt 字段**。 |
+| "User 没有 createdAt/modifiedAt 怎么办" | User 构造函数中初始化 `registeredAt = new DateTime()`（[User.php L247](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/Entity/User.php#L247)），另外 `last_login` 由登录监听器设置，两者都不经过 onFlush。 |
 | "非 Timesheet 实体的 createdAt 不 recompute 会不会丢" | **分场景**：INSERT 不会丢（INSERT 直接读对象状态）；UPDATE 会丢（UPDATE 依赖 ChangeSet）。但实际几乎不触发，因为构造函数已设值。 |
 | "Invoice 有自动时间戳吗" | ❌ 没有。Invoice 有 `created_at` 字段但不实现 `CreatedAt` 接口，ModifiedSubscriber 不处理它，由业务代码手动赋值。 |
 | "Calculator 优先级与 Doctrine 监听器一样吗" | **完全相反**：Calculator 数字越大越晚执行（RateReset 50 → Rate 300）；Doctrine 监听器数字越大越早执行（Modified 60 → Timesheet 50）。 |
 | "四个系统 Calculator 执行顺序是啥" | RateReset(50) → Billable(100) → Duration(200) → Rate(300) |
+| "集合变更（如 Tag 增删）能在 ChangeSet 里拿到吗" | ❌ **不能**。集合变更在 UnitOfWork 中与标量变更**分开追踪**，必须遍历 `getScheduledCollectionUpdates()` + `getScheduledCollectionDeletions()`，用 `$coll->getInsertDiff()` / `getDeleteDiff()` 获取差异。 |
+| "只修改 Timesheet 的 Tag 不修改其他字段会触发实体 Update 吗" | ✅ **会**。Doctrine 检测到集合变更会把 owning-side 实体标记为 dirty，使其进入 `getScheduledEntityUpdates()`，因此 modifiedAt 也会正常更新。但审计代码**只遍历 entity updates 就会漏掉 Tag 差异**。 |
+| "XxxCreateEvent（不带 Pre/Post）和 XxxCreatePostEvent 有啥区别" | 前者是**非持久化创建事件**（对象刚 new 出来，可能永远不保存），后者是**真正落库后**的 Post 事件。审计要记录真正创建的，应订阅 **Post** 事件。 |
+| "删除事件有几种模式" | **三种**：模式 A 只有 Pre（Timesheet）；模式 B Pre + Delete + Post 三级（User）；模式 C 只有 Delete 一种（Project/Customer/Activity/Team/Invoice）。不要想当然地以为所有实体都有 Pre/Post。 |
 | "批量更新能不能拿到每实体变更集" | 走 `saveMultiple`（路径 A）✅ 可以；走 DQL UPDATE（路径 B）❌ 完全不行 |
 | "更新时 Pre 和 Post 哪个能拿到旧值" | Pre/Post 都只能拿到已修改的对象；**真正的字段旧值要在 onFlush 中通过 `getEntityChangeSet()` 获取** |
 | "删除用户时 Timesheet 的 user 被改了会不会触发事件" | ❌ 不会，内部用 DQL 直接 UPDATE，是审计盲区 |
