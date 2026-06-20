@@ -114,7 +114,13 @@ flush() 触发 onFlush
    └── 调用 getEntityChangeSet()                   ← 拿到【最终完整变更集】
 ```
 
-### 3.3 ChangeSet 的三阶段演变
+### 3.3 ChangeSet 的三阶段演变（⚠️ 仅 Timesheet 实体适用）
+
+> **重要提醒**：这三阶段演变是 **Timesheet 实体特有的现象**，因为只有 Timesheet 同时满足：
+> 1. 实现了 `ModifiedAt` 接口（被 ModifiedSubscriber 修改）
+> 2. 有专门的 `TimesheetSubscriber` 调用 `recomputeSingleEntityChangeSet()`
+>
+> 对于 Project / Customer / Activity 等非 Timesheet 实体，详见 **3.4 节**。
 
 | 阶段 | priority 区间 | 调用 `getEntityChangeSet()` 能拿到什么 |
 |------|--------------|--------------------------------------|
@@ -122,30 +128,56 @@ flush() 触发 onFlush
 | **阶段 2：中间状态** | 50 ~ 60 之间 | **对象上 modifiedAt 已改，但 ChangeSet 中没有**（陷阱地带） |
 | **阶段 3：最终变更** | < 50 | 完整 ChangeSet：用户修改 + 系统计算字段 + modifiedAt |
 
-### 3.4 代码定位
+### 3.4 非 Timesheet 实体的 ChangeSet 与时间字段（容易被忽略）
 
-| 节点 | 文件 | 行号 |
-|------|------|------|
-| ModifiedSubscriber (priority=60) | [ModifiedSubscriber.php](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/Doctrine/ModifiedSubscriber.php#L22-L54) | L22-L54 |
-| TimesheetSubscriber (priority=50) | [TimesheetSubscriber.php](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/Doctrine/TimesheetSubscriber.php#L25-L98) | L25-L98 |
-| recomputeSingleEntityChangeSet | [TimesheetSubscriber.php](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/Doctrine/TimesheetSubscriber.php#L61-L63) | L62 |
+#### 3.4.1 实体时间字段全景
 
-### 3.5 为什么只有 Timesheet 有 modifiedAt？
+| 实体 | `ModifiedAt` 接口 | `CreatedAt` 接口 | `createdAt` 字段 | `modifiedAt` 字段 | 时间字段赋值方式 |
+|------|-------------------|------------------|-----------------|------------------|----------------|
+| `Timesheet` | ✅ 是 | ❌ 否 | ❌ 无 | ✅ 有 | ModifiedSubscriber (onFlush) |
+| `Project` | ❌ 否 | ✅ 是 | ✅ 有 | ❌ 无 | 构造函数中手动设置 |
+| `Customer` | ❌ 否 | ✅ 是 | ✅ 有 | ❌ 无 | 构造函数中手动设置 |
+| `Activity` | ❌ 否 | ✅ 是 | ✅ 有 | ❌ 无 | 构造函数中手动设置 |
+| `Invoice` | ❌ 否 | ❌ 否 | ✅ 有 | ❌ 无 | 业务代码手动设置（from InvoiceDate） |
+| `User` | ❌ 否 | ❌ 否 | ❌ 无 | ❌ 无 | 无自动时间戳 |
 
-检查实体接口实现：
-- `Timesheet` → 实现 `ModifiedAt` 接口 ✅
-- `Project` → 只实现 `CreatedAt`，无 `ModifiedAt` ❌
-- `Customer` → 只实现 `CreatedAt`，无 `ModifiedAt` ❌
-- `Activity` → 只实现 `CreatedAt`，无 `ModifiedAt` ❌
-- `User` → 无时间戳接口 ❌
+> **关于 Invoice 的说明**：Invoice 实体有 `created_at` 数据库字段（[Invoice.php L80](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/Entity/Invoice.php#L80)），但**不实现 `CreatedAt` 接口**，因此 ModifiedSubscriber **不会** 自动为其赋值。它的 createdAt 由业务逻辑在创建发票时从 `invoiceDate` 手动设置。
 
-因此 **ModifiedSubscriber 只会自动更新 Timesheet 的 modifiedAt**，其他实体的时间字段需要在业务代码中手动维护。
+#### 3.4.2 非 Timesheet 实体的 ChangeSet 是稳定的
 
-### 3.6 Calculator 内部的优先级（⚠️ 另一个规则）
+对于 Project / Customer / Activity 等实体：
+- **没有任何 onFlush 订阅器修改它们**（ModifiedSubscriber 只改 ModifiedAt 实体，而它们不实现该接口）
+- 因此 **ChangeSet 在整个 onFlush 过程中是不变的**
+- 无论 priority 是多少，`getEntityChangeSet()` 返回的内容都一样
+- 不存在「中间陷阱地带」的问题
 
-`TimesheetSubscriber` 内部调用的 `CalculatorInterface` 链**使用相反的优先级规则**：
+#### 3.4.3 createdAt 持久化核实（INSERT vs UPDATE）
 
-[CalculatorInterface.php](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/Timesheet/CalculatorInterface.php#L31-L37)：
+用户常见疑问：非 Timesheet 实体的 createdAt 由 ModifiedSubscriber 赋值后，没有 recompute 会不会丢失？
+
+**答案分两种情况**：
+
+| 操作类型 | ModifiedSubscriber 赋值后能否持久化？ | 原因 |
+|---------|--------------------------------------|------|
+| **INSERT（新实体）** | ✅ **可以** | INSERT 不依赖 ChangeSet，Doctrine 直接从对象当前状态生成 INSERT SQL。onFlush 中对对象的任何修改都会反映到最终 SQL。 |
+| **UPDATE（已有实体）** | ❌ **不可以** | UPDATE 依赖预计算的 ChangeSet。onFlush 中修改对象后若不调用 `recomputeSingleEntityChangeSet()`，修改不会被写入 UPDATE SQL。 |
+
+**但实际影响很小**，因为：
+- Project / Customer / Activity 的 createdAt 在 **构造函数** 中就已设置（如 [Project.php L185](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/Entity/Project.php#L185)）
+- ModifiedSubscriber 只在 `getCreatedAt() === null` 时才会赋值（[ModifiedSubscriber.php L41](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/Doctrine/ModifiedSubscriber.php#L41)）
+- 正常情况下 createdAt 永远不为 null，所以 ModifiedSubscriber 的 createdAt 逻辑对这些实体 **几乎永远不会触发**
+
+**真正需要注意的只有 Timesheet 的 modifiedAt**：
+- Timesheet 实现了 `ModifiedAt`，每次 UPDATE 都会被 ModifiedSubscriber 调用 `setModifiedAt()`
+- ModifiedSubscriber 不做 recompute
+- **依赖 TimesheetSubscriber 的 recompute 来把 modifiedAt 纳入最终 UPDATE SQL**
+- 这是一个隐式耦合：如果没有 TimesheetSubscriber，Timesheet 的 modifiedAt 更新将不会被持久化
+
+### 3.5 Calculator 内部的优先级（⚠️ 与 Doctrine 规则相反）
+
+`TimesheetSubscriber` 内部调用的 `CalculatorInterface` 链**使用相反的优先级规则**。
+
+[CalculatorInterface.php L31-L37](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/Timesheet/CalculatorInterface.php#L31-L37)：
 ```php
 /*
  * Default priority is 1000 (after all system Calculator were executed).
@@ -156,13 +188,27 @@ flush() 触发 onFlush
 public function getPriority(): int;
 ```
 
-即：**Calculator 优先级数字越大，越晚执行**，与 Doctrine 监听器规则相反。
+即：**Calculator 优先级数字越大，越晚执行**，与 Doctrine 监听器（数字越大越早）规则完全相反。
 
-当前系统内置 Calculator 优先级（代码内可查）：
-- `DurationCalculator` → 计算时长
-- `BillableCalculator` → 计算可计费状态
-- `RateCalculator` → 计算费率
-- `RateResetCalculator` → 重置费率
+#### 3.5.1 系统内置 Calculator 优先级与执行顺序
+
+| Calculator | Priority | 执行顺序 | 职责 | 所在文件 |
+|------------|----------|----------|------|----------|
+| `RateResetCalculator` | **50** | 🔴 最早 | 检测 project/activity/user 变更时自动重置费率 | [RateResetCalculator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/Timesheet/Calculator/RateResetCalculator.php#L38-L42) |
+| `BillableCalculator` | **100** | 🟡 第二 | 根据项目/活动/客户的 billable 设置自动计算 billable 状态 | [BillableCalculator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/Timesheet/Calculator/BillableCalculator.php#L54-L57) |
+| `DurationCalculator` | **200** | 🟢 第三 | 计算时长 + 应用舍入规则 | [DurationCalculator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/Timesheet/Calculator/DurationCalculator.php#L37-L40) |
+| `RateCalculator` | **300** | 🔵 最晚 | 计算最终 rate / internalRate / hourlyRate / fixedRate | [RateCalculator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/55-kimai/src/Timesheet/Calculator/RateCalculator.php#L41-L44) |
+
+**执行顺序**：RateReset(50) → Billable(100) → Duration(200) → Rate(300)
+
+> **为什么 RateReset 要最先执行？** 它检测到关联实体（项目/活动/用户）变更时，会先把所有费率重置，再由后续的 RateCalculator 重新计算，确保费率总是基于最新的关联数据。
+
+#### 3.5.2 与 Doctrine 监听器优先级的对比
+
+| 系统 | 优先级规则 | 例子 |
+|------|-----------|------|
+| **Doctrine 监听器** (AsDoctrineListener) | 数字越大，**越早** 执行 | ModifiedSubscriber(60) → TimesheetSubscriber(50) |
+| **Calculator 链** (CalculatorInterface) | 数字越大，**越晚** 执行 | RateReset(50) → Billable(100) → Duration(200) → Rate(300) |
 
 ---
 
@@ -363,10 +409,14 @@ repository->deleteMultiple($timesheets)
 
 ### 7.1 审计订阅器插入时机选择
 
-| 插入时机（priority） | 适用场景 | 能拿到的 ChangeSet | 说明 |
-|---------------------|----------|-------------------|------|
+> ⚠️ **以下三阶段划分仅适用于 Timesheet 实体**。
+>
+> 对于 Project / Customer / Activity / Invoice 等非 Timesheet 实体，由于没有任何 onFlush 订阅器修改它们的字段，**ChangeSet 在整个 onFlush 过程中保持不变**，不存在「中间陷阱地带」，也不需要区分 priority。
+
+| 插入时机（priority） | 适用场景 | 能拿到的 Timesheet ChangeSet | 说明 |
+|---------------------|----------|-----------------------------|------|
 | **> 60**（如 70） | 记录「用户真实意图」 | 原始用户变更，不含系统计算字段和 modifiedAt | 适合做操作意图审计 |
-| **50 ~ 60 之间**（如 55） | ❌ 不推荐 | 陷阱地带：对象已改但 ChangeSet 未更新 | 避免在这个区间插入 |
+| **50 ~ 60 之间**（如 55） | ❌ 不推荐 | 陷阱地带：对象已改但 ChangeSet 未更新 | 避免在这个区间插入审计订阅器 |
 | **< 50**（如 10） | 记录「最终持久化状态」 | 完整变更集（用户修改 + 系统计算 + modifiedAt）| ✅ 推荐用于数据变更审计 |
 
 ### 7.2 必须订阅的事件清单
@@ -484,17 +534,21 @@ final class AuditLogSubscriber implements EventSubscriber
 
 ---
 
-## 八、总结：链路直白化要点（修正版）
+## 八、总结：链路直白化要点（二次修正版）
 
 | 之前容易混淆的点 | 澄清结论 |
 |------------------|----------|
 | "Loggable/Versioned 为啥搜不到使用处" | 核心仅定义 Attribute，消费逻辑需插件自行实现（预留扩展点） |
 | "onFlush 中两个订阅器谁先执行" | **priority 越大越早** → `priority 60` (ModifiedSubscriber) → `priority 50` (TimesheetSubscriber) |
 | "ModifiedSubscriber 改了 modifiedAt 为什么不 recompute" | 故意不 recompute，**依赖 TimesheetSubscriber 的 recompute** 来把 modifiedAt 纳入最终变更集。这是隐式耦合。 |
-| "什么 priority 能拿到完整 ChangeSet" | 必须 **< 50**，在 TimesheetSubscriber 之后执行 |
-| "priority 50~60 之间插入会怎样" | 陷阱地带：对象上 modifiedAt 已改，但 `getEntityChangeSet()` 拿不到 |
-| "所有实体都有 modifiedAt 吗" | 只有 `Timesheet` 实现了 `ModifiedAt`，其他实体只有 `CreatedAt` |
-| "Calculator 优先级与 Doctrine 监听器一样吗" | **相反**：Calculator 数字越大越晚执行，Doctrine 监听器数字越大越早执行 |
+| "变更集三阶段对所有实体都成立吗" | ❌ **不成立**。仅 Timesheet 实体有三阶段演变。Project/Customer/Activity 等实体在 onFlush 中无人修改，ChangeSet 全程不变。 |
+| "什么 priority 能拿到完整 ChangeSet" | 对 Timesheet：必须 **< 50**，在 TimesheetSubscriber 之后执行；对其他实体：任意 priority 都一样 |
+| "priority 50~60 之间插入会怎样" | 对 Timesheet：陷阱地带（对象上 modifiedAt 已改，但 ChangeSet 中没有）；对其他实体：无影响 |
+| "所有实体都有 modifiedAt 吗" | 只有 `Timesheet` 实现了 `ModifiedAt` 接口。Project/Customer/Activity 只有 `CreatedAt`，Invoice 有 createdAt 字段但不实现接口。 |
+| "非 Timesheet 实体的 createdAt 不 recompute 会不会丢" | **分场景**：INSERT 不会丢（INSERT 直接读对象状态）；UPDATE 会丢（UPDATE 依赖 ChangeSet）。但实际几乎不触发，因为构造函数已设值。 |
+| "Invoice 有自动时间戳吗" | ❌ 没有。Invoice 有 `created_at` 字段但不实现 `CreatedAt` 接口，ModifiedSubscriber 不处理它，由业务代码手动赋值。 |
+| "Calculator 优先级与 Doctrine 监听器一样吗" | **完全相反**：Calculator 数字越大越晚执行（RateReset 50 → Rate 300）；Doctrine 监听器数字越大越早执行（Modified 60 → Timesheet 50）。 |
+| "四个系统 Calculator 执行顺序是啥" | RateReset(50) → Billable(100) → Duration(200) → Rate(300) |
 | "批量更新能不能拿到每实体变更集" | 走 `saveMultiple`（路径 A）✅ 可以；走 DQL UPDATE（路径 B）❌ 完全不行 |
 | "更新时 Pre 和 Post 哪个能拿到旧值" | Pre/Post 都只能拿到已修改的对象；**真正的字段旧值要在 onFlush 中通过 `getEntityChangeSet()` 获取** |
 | "删除用户时 Timesheet 的 user 被改了会不会触发事件" | ❌ 不会，内部用 DQL 直接 UPDATE，是审计盲区 |
