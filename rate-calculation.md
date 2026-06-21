@@ -370,7 +370,7 @@ foreach (['project', 'activity', 'user'] as $field) {
 
 ### 5.2 计算逻辑
 
-在 [BillableCalculator::calculate()](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/Calculator/BillableCalculator.php#L20-L52) 中：
+在 [BillableCalculator::calculate()](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/Calculator/BillableCalculator.php#L20-L51) 中：
 
 ```php
 switch ($record->getBillableMode()) {
@@ -382,35 +382,44 @@ switch ($record->getBillableMode()) {
         break;
     case Timesheet::BILLABLE_AUTOMATIC:
         $billable = true;
-        // 活动不可计费 → false
-        $activity = $record->getActivity();
-        if ($activity !== null && !$activity->isBillable()) {
-            $billable = false;
-        }
-        // 项目不可计费 → false
-        $project = $record->getProject();
-        if ($billable && $project !== null && !$project->isBillable()) {
-            $billable = false;
-        }
-        // 客户不可计费 → false
-        if ($billable && $project !== null) {
-            $customer = $project->getCustomer();
-            if ($customer !== null && !$customer->isBillable()) {
-                $billable = false;
-            }
-        }
+        // ... 继承链逻辑
         $record->setBillable($billable);
         break;
 }
 ```
 
-**自动模式的继承链**（任一为 false 则结果为 false，类似"与"逻辑）：
+**重要：switch 只覆盖了 NO / YES / AUTOMATIC 三个 case，没有 `default` 分支。**
+
+而实体上的两个初始值为：
+- `$billable = true`（[Timesheet.php#L193](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Entity/Timesheet.php#L193)）
+- `$billableMode = self::BILLABLE_DEFAULT`（[Timesheet.php#L198](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Entity/Timesheet.php#L198)）
+
+所以：
+- 当 `billableMode === DEFAULT` 时，BillableCalculator **什么也不做**，switch 直接穿透
+- `billable` 字段保持 PHP 属性的初始值 `true`
+- 即：DEFAULT → billable 恒为 true（不经过任何继承链）
+
+自动模式的继承链（任一为 false 则结果为 false，类似"与"逻辑）：
 
 ```
 activity.billable  →  project.billable  →  customer.billable  →  最终 billable
 ```
 
-### 5.3 与费率计算的关系
+### 5.3 DEFAULT 的生命周期
+
+`BILLABLE_DEFAULT`（值为 `'default'`）是一个**过渡态**，只存在于实体刚构造、尚未进入业务流程的短暂窗口。它的流转路径：
+
+| 阶段 | 发生位置 | 行为 | 代码 |
+|------|---------|------|------|
+| **1. 构造初始** | `new Timesheet()` | `$billableMode = BILLABLE_DEFAULT`，`$billable = true` | [Timesheet.php#L198](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Entity/Timesheet.php#L198) |
+| **2. 创建新工时** | `TimesheetService::prepareNewTimesheet()` | 显式设置 `BILLABLE_AUTOMATIC`，覆盖 DEFAULT | [TimesheetService.php#L88](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/TimesheetService.php#L88) |
+| **3. Web 表单渲染前** | `TimesheetEditForm::addBillable()` CallbackTransformer::transform | 如果仍为 DEFAULT，根据当前 `billable` 值换成 YES 或 NO（billable=true→YES，billable=false→NO），让下拉框有具体选项 | [TimesheetEditForm.php#L426-L442](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Form/TimesheetEditForm.php#L426-L442) |
+| **4. API 提交时** | `TimesheetApiEditForm` PRE_SUBMIT 事件 | 传入 `billable` 布尔值 → 先置 AUTOMATIC，再根据 true/false 改成 YES 或 NO；不传 billable 就保持 AUTOMATIC | [TimesheetApiEditForm.php#L36-L52](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Form/API/TimesheetApiEditForm.php#L36-L52) |
+| **5. resetRates()** | `Timesheet::resetRates()` | 显式设置 `BILLABLE_AUTOMATIC`，**不会**设回 DEFAULT | [Timesheet.php#L594](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Entity/Timesheet.php#L594) |
+
+**结论**：DEFAULT 只会出现在 `new Timesheet()` 之后、调用 `prepareNewTimesheet()` 之前的极短时间窗口。如果绕过 TimesheetService 直接 `new Timesheet()` 并 flush（测试代码中常见），BillableCalculator 就拿 DEFAULT 没办法，billable 恒为 true。
+
+### 5.4 与费率计算的关系
 
 **注意**：`billable` 字段**不影响 `RateService::calculate()` 的计算过程**。也就是说，即使一条工时被标记为不可计费，它的 `rate` 字段仍然会照常算出金额。
 
@@ -566,7 +575,7 @@ $qb->expr()->orX(
 
 - Step 2 直接拿到 `$hourlyRate = 200`
 - Step 3 即便查到 ActivityRate 100，因 `??=` 也不会覆盖
-- 星期 factor 不再生效（判断条件读的是 `$record->getHourlyRate()`，它不是 null）
+- 星期 factor 不再生效：判断条件 `$record->getFixedRate() === null && $record->getHourlyRate() === null` 中 hourlyRate 已是 200，**双 null 条件不成立**（注意：读的是工时实体上的字段值，不是计算过程中的临时变量；必须 fixedRate 与 hourlyRate 同为 null 才启用 factor）
 - 总金额 = 200 × duration / 3600
 
 **场景 E：用户把某条工时从项目 A 改到项目 B。**
