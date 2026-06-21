@@ -364,26 +364,112 @@ private function getPaginatorForQuery(TimesheetQuery $timesheetQuery): Paginator
 
 ### 5.1 Pagination 类
 
-[Pagination](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Utils/Pagination.php) 继承自 `Pagerfanta\Pagerfanta`，在构造函数中绑定 Query 参数：
+[Pagination](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Utils/Pagination.php) 继承自 `Pagerfanta\Pagerfanta`，在构造函数中分**三段**绑定参数，其中第 ① 段是 ArrayAdapter 全量加载的特殊分支：
 
 ```php
 public function __construct(AdapterInterface $adapter, ?BaseQuery $query = null)
 {
     parent::__construct($adapter);
 
-    if ($query !== null) {
-        $this->setMaxPerPage($query->getPageSize());   // size 参数
-        $this->setCurrentPage($query->getPage());      // page 参数
+    // ① ArrayAdapter 分支：全量数组 → MaxPerPage = 数组总长度
+    if ($adapter instanceof ArrayAdapter && ($size = $adapter->getNbResults()) > 0) {
+        $this->setMaxPerPage($size);
     }
 
-    // 仅非 API 调用时，越界页自动规范化（如第 999/10 页 → 自动改为第 10 页）
-    // API 调用时保留原始越界行为 → 触发 404 异常链
+    // ② 越界页规范化：仅非 API 调用时
     if ($query === null || !$query->isApiCall()) {
         $this->setNormalizeOutOfRangePages(true);
+    }
+
+    // ③ Query 参数覆盖（在 ① 之后，可覆盖）
+    if ($query !== null) {
+        $this->setMaxPerPage($query->getPageSize());
+        $this->setCurrentPage($query->getPage());
     }
 }
 ```
 
+**执行顺序至关重要**：③ 在 ① 之后执行，意味着若传入了 `$query`，③ 中的 `setMaxPerPage($query->getPageSize())` 会覆盖 ① 中设置的数组长度。反之，若 `$query === null`（无 API 上下文），① 中的 `setMaxPerPage($size)` 生效。
+
+#### 5.1.0.1 ArrayAdapter 分支的判断逻辑细节
+
+第 ① 段的 `if` 条件由两部分组成，**同时满足**才会执行：
+
+| 判断条件 | 代码 | 含义 |
+|---------|------|------|
+| **类型检查** | `$adapter instanceof ArrayAdapter` | 严格匹配 Pagerfanta 内置的 `Pagerfanta\Adapter\ArrayAdapter` 类，不接受其他适配器 |
+| **长度检查** | `($size = $adapter->getNbResults()) > 0` | 获取数组总长度，且必须大于 0（空数组不执行 `setMaxPerPage(0)`，避免除零错误） |
+
+`getNbResults()` 对 ArrayAdapter 而言就是 `count($this->array)`，直接返回数组长度，无数据库查询。
+
+#### 5.1.0.2 与 setMaxPerPage 二次覆盖的完整关系
+
+`setMaxPerPage()` 在 Pagination 生命周期中可能被调用 **多次**，执行顺序决定最终值：
+
+```
+构造函数内部（3 次可能）:
+  ① ArrayAdapter 分支：  setMaxPerPage(数组长度)  ← 第 1 次（仅 ArrayAdapter）
+  ③ Query 参数覆盖：     setMaxPerPage($query->getPageSize())  ← 第 2 次（仅传入 $query 时）
+        │
+        ▼ 若 ① 和 ③ 同时存在，③ 覆盖 ①
+
+构造函数外部（第 3 次可能）:
+  ④ 调用方手动设置：    $pagination->setMaxPerPage(9999)  ← 第 3 次（优先级最高）
+```
+
+四种典型场景的最终 `MaxPerPage` 对比：
+
+| 场景 | 适配器类型 | $query 参数 | ① ArrayAdapter | ③ Query 覆盖 | ④ 外部覆盖 | 最终 MaxPerPage |
+|------|-----------|------------|---------------|------------|-----------|----------------|
+| **HelpController 语言列表** | ArrayAdapter | ❌ `null` | ✅ 50（假设 50 种语言） | ❌ | ✅ 9999 | **9999** |
+| **API 分页型端点** | LoaderQueryPaginator | ✅ 传入 | ❌ | ✅ 50（默认） | ❌ | **50** |
+| **TagRepository 特殊场景** | QueryPaginator | ❌ `null` | ❌ | ❌ | ✅ 50 | **50** |
+| **TimesheetResult 导出** | LoaderQueryPaginator | ❌ `null` | ❌ | ❌ | ✅ 50 | **50** |
+
+> **关键观察**：HelpController 场景中，构造函数 ① 设置的 `setMaxPerPage(50)` 实际上**从未生效**，因为外部会立即覆盖为 `9999`。① 分支的设计意图更偏向"防御性默认值"，而非实际业务逻辑。
+
+---
+
+### 5.1.1 ArrayAdapter 全量加载分支的使用场景
+
+#### 5.1.1.1 唯一使用处：HelpController 语言列表
+
+`ArrayAdapter` 的**唯一使用处**在 Web 端 [HelpController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Controller/HelpController.php#L50-L53)：
+
+```php
+// HelpController::helpLocale() — 语言列表页（非 API）
+$data = $this->buildLocales($request, $service);  // 已完整加载的 PHP 数组
+$pagination = new Pagination(new ArrayAdapter($data));  // ① 触发 ArrayAdapter 分支
+$pagination->setMaxPerPage(9999);  // ④ 外部覆盖，强制不分页
+$table->setPagination($pagination);
+```
+
+完整执行路径：
+1. `buildLocales()` 从 `LocaleService::getAllLocales()` 加载所有支持的语言（约 50 种），构造完整的展示数据数组
+2. `new ArrayAdapter($data)` 包装全量数组（已在内存中，无数据库查询）
+3. `new Pagination(new ArrayAdapter($data))` 触发构造函数：
+   - ① `setMaxPerPage(50)`（数组长度，假设 50 种语言）
+   - ② `setNormalizeOutOfRangePages(true)`（`$query === null`）
+   - ③ 跳过（无 `$query`）
+4. `$pagination->setMaxPerPage(9999)` 外部覆盖，确保整数组在单页显示
+5. Pagination 对象传入 DataTable，由 Twig 模板渲染分页组件（因 MaxPerPage=9999 大于总数，实际无分页按钮）
+
+#### 5.1.1.2 代码库中所有 Pagination 使用场景分类
+
+对 11 处 `new Pagination(...)` 调用的完整分类：
+
+| 类别 | 调用位置 | 适配器类型 | $query 参数 | 外部是否再次 setMaxPerPage | 设计意图 |
+|------|---------|-----------|------------|---------------------------|---------|
+| **A. API 标准分页**（10 处） | [TimesheetRepository](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/TimesheetRepository.php#L450) 等 | LoaderQueryPaginator / QueryPaginator | ✅ 传入 | ❌ | 标准数据库分页，构造函数 ③ 完成全部设置 |
+| **B. Web 全量列表**（1 处） | [HelpController](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Controller/HelpController.php#L51) | ArrayAdapter | ❌ `null` | ✅ 设为 9999 | 内存数组不分页，复用 DataTable 组件 |
+| **C. Web 分页特殊场景**（2 处） | [TagRepository](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/TagRepository.php#L126)、[TimesheetResult](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Result/TimesheetResult.php#L97) | QueryPaginator / LoaderQueryPaginator | ❌ `null` | ✅ 手动设置 | 因特殊查询构造无法传入 Query，外部手动补充分页参数 |
+
+#### 5.1.1.3 ArrayAdapter 分支的设计意图
+
+- **复用模板**：通过 Pagination → DataTable → Twig 的完整渲染链，避免为小型全量列表单独开发无分页的渲染逻辑
+- **防御性默认**：若调用方忘记外部 `setMaxPerPage(9999)`，① 分支的 `setMaxPerPage(数组长度)` 也能保证单页显示（不会意外分页截断）
+- **类型安全**：严格的 `instanceof ArrayAdapter` 确保不会对数据库查询适配器误触发全量加载
+- **性能考量**：ArrayAdapter 仅用于内存数组，**从不用于数据库查询结果**——数据库查询走 `QueryPaginator` 或 `LoaderQueryPaginator` 实现真正的 LIMIT/OFFSET 分页
 ### 5.2 ViewHandler 响应头注入
 
 [ViewHandler](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/ViewHandler.php#L52-L67) 装饰 FOSRestBundle 的基础 ViewHandler，**在序列化前**检测 View 数据是否为 `Pagination` 实例：
