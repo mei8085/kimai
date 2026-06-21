@@ -294,7 +294,34 @@ public function onFlush(OnFlushEventArgs $args): void
 | 300 | RateCalculator | 调用 RateService 计算费率金额并写回 |
 | 1000（默认） | 第三方/插件计算器 | 默认优先级 |
 
-在 [TimesheetSubscriber::calculateFields()](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Doctrine/TimesheetSubscriber.php#L75-L97) 中按 priority 排序后依次执行。如果两个计算器 priority 相同，会用 `$i++` 错开保证不覆盖。
+在 [TimesheetSubscriber::calculateFields()](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Doctrine/TimesheetSubscriber.php#L75-L97) 中按 priority 排序后依次执行：
+
+```php
+private function calculateFields(Timesheet $entity, array $changes = []): void
+{
+    if ($this->sorted === null) {
+        $this->sorted = [];
+        foreach ($this->calculators as $calculator) {
+            $i = 0;
+            $prio = $calculator->getPriority();
+            do {
+                $key = $prio + $i++;
+            } while (\array_key_exists($key, $this->sorted));
+            $this->sorted[$key] = $calculator;
+        }
+        ksort($this->sorted);
+    }
+    foreach ($this->sorted as $calculator) {
+        $calculator->calculate($entity, $changes);
+    }
+}
+```
+
+**同 priority 的 FIFO 机制**：
+
+- 两个计算器 priority 相同时，第一个 `key = prio`，第二个因为 `key = prio` 已存在而走 `do-while` 变成 `key = prio + 1`，第三个 `prio + 2`，以此类推
+- `ksort` 升序排列后，key 小的先执行 → **先注入的先执行 → FIFO**
+- 核心服务（RateCalculator）总是先于插件注册，所以插件追加的 priority=300 自定义计算器 key 更大，在 RateCalculator **之后**执行，从而可以覆盖核心费率计算结果
 
 ### 4.3 changeset 的作用
 
@@ -563,14 +590,20 @@ $qb->expr()->orX(
 
 4. **"同一层级既存在指定用户又存在不限用户"** —— 指定用户的 score +1，优先命中。
 
-5. **"内部费率 internalRate 的兜底"** —— 最后回退到 hourlyRate，所以如果只配了对外费率，内部成本默认等于对外费率。
+5. **"内部费率 internalRate 的兜底"** —— Hourly 路径最后回退到 hourlyRate，Fixed 路径最后回退到 **fixedRate**（注意两条路径的兜底默认值不同）。所以如果只配了对外费率、没配 INTERNAL_RATE 偏好，内部成本就等于对外金额。
 
 6. **"同分覆盖不确定"** —— getBestFittingRate() 用 score 当数组键，同分时后遍历到的覆盖先遍历到的。比如 activity=X+user=Y 和 activity=null+user=Y 都是 score=6，选哪条取决于数据库返回顺序。
 
 7. **"billable=false 也会计入 rate"** —— 是的，billable 只影响报表和开票，不影响 rate 字段的计算。
 
-8. **"project 为 null 时 findMatchingRates 会崩"** —— CustomerRate 查询中直接 `getProject()->getCustomer()` 链式调用，正常业务不会触发，但测试或边界场景可能 NPE。
+8. **"DEFAULT billableMode 怎么 billable 是 true？"** —— BillableCalculator 的 switch 漏了 DEFAULT case，billableMode='default' 时什么也不做，于是取实体字段 `$billable = true` 的 PHP 初始值。正常业务流程中 DEFAULT 会被 prepareNewTimesheet() 改成 AUTOMATIC，所以一般遇不到。
 
-9. **"Decimal 模式怎么切"** —— 系统配置 `invoice.rounding_mode` 设为 `decimal` 即启用十进制模式，其他值用默认经典模式。配置入口在 [RateCalculatorFactory.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/RateCalculator/RateCalculatorFactory.php)。
+9. **"factor 不生效的排查清单"** —— 必须 `timesheet.fixedRate === null` **且** `timesheet.hourlyRate === null` 双空。只要任一字段有值（包括上次计算写回的 hourlyRate），factor 就完全不启用。注意判断读的是实体上的原始字段，不是计算过程中的变量。
 
-10. **"计算器执行顺序"** —— 50（重置）→ 100（可计费）→ 200（时长）→ 300（费率）。费率计算放在最后，确保 duration 已经算好（含舍入）。
+10. **"project 为 null 时 findMatchingRates 会崩"** —— CustomerRate 查询中直接 `getProject()->getCustomer()` 链式调用，正常业务不会触发（project 必填），但测试或边界场景可能 NPE。
+
+11. **"Decimal 模式怎么切"** —— 系统配置 `invoice.rounding_mode` 设为 `'decimal'` 即启用十进制模式，其他任何值用默认经典模式。配置入口在 [RateCalculatorFactory.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/RateCalculator/RateCalculatorFactory.php)。
+
+12. **"计算器执行顺序"** —— 50（重置）→ 100（可计费）→ 200（时长）→ 300（费率）。费率计算放在最后，确保 duration 已经算好（含舍入）。同 priority 用 `$i++` 错开键值，结果是 **FIFO（先注入的先执行）**，插件追加的 priority=300 计算器会在核心 RateCalculator 之后跑，从而可以覆盖结果。
+
+13. **"DEFAULT billableMode 的生命周期"** —— DEFAULT 是过渡态：构造时是 DEFAULT；`prepareNewTimesheet()` 把它改成 AUTOMATIC；Web 表单渲染前根据 billable 值换成 YES / NO 供用户选择；API 提交时根据 billable 布尔值换成 YES / NO / AUTOMATIC。DEFAULT→billable=true 这条路径只在"绕过 TimesheetService 直接 new 并 flush"时才会走。
