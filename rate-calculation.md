@@ -168,7 +168,8 @@ if (null !== $fixedRate) {
 
 - 返回值中：`rate`（总金额） = `fixedRate`
 - `hourlyRate` 字段返回 null，`fixedRate` 字段返回原值
-- 内部费率兜底取用户偏好 `INTERNAL_RATE`，再兜底就是 fixedRate 本身
+- **internalRate 回退链**：匹配费率.internalRate → 用户偏好 INTERNAL_RATE → **`$fixedRate` 本身**（注意这里兜底默认传的是 `$fixedRate`，不是对外 hourly 路径中的 `$hourlyRate`）
+- 所以如果走固定费率路径，且用户没有单独配置 INTERNAL_RATE，内部成本就等于对外固定金额
 
 ### Step 5：小时费率兜底 —— 用户偏好
 
