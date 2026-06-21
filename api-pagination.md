@@ -1,4 +1,4 @@
-# Kimai REST API 列表分页与过滤契约
+﻿# Kimai REST API 列表分页与过滤契约
 
 本文档从代码实现角度，梳理 Kimai REST API 中列表端点（collection endpoint）的参数解析、查询构造、总数计算与分页响应的完整流程。
 
@@ -92,7 +92,7 @@ ViewHandler::handle(View $view)
 
 ### 2.3 参数校验的层级关系
 
-`page` 和 `size` 参数在分页型端点中经历**双层校验**：
+`page` 和 `size` 参数在分页型端点中经历**三层校验/过滤**：
 
 ```
 第一层：ParamFetcher 注解层（请求进入 Controller 之前）
@@ -101,9 +101,22 @@ ViewHandler::handle(View $view)
         │
         ▼
 第二层：prepareQuery() 业务层（Controller 内部）
-  ├── page: is_numeric() + > 0  → 非正整数则忽略（不报错，使用默认值 1）
+  ├── page: is_numeric() + > 0  → 非正整数则忽略（不报错，不调用 setPage）
   └── size: 1 <= size <= 500    → < 1 回退到 50，> 500 截断到 500
+        │
+        ▼
+第三层：BaseQuery setter 层（写入对象前的最终防线）
+  ├── setPage(?int $page):      → $page !== null && $page > 0 才赋值
+  │     [BaseQuery.php#L121-L128]
+  ├── setPageSize(?int $size):  → $pageSize !== null && $pageSize > 0 才赋值
+  │     [BaseQuery.php#L135-L142]
+  ├── setOrderBy(?string):      → null 回退到 defaults['orderBy']
+  │     [BaseQuery.php#L159-L168]
+  └── setOrder(?string):        → 仅 ASC/DESC 接受，其他静默忽略
+        [BaseQuery.php#L175-L186]
 ```
+
+**第三层 setter 的关键意义**：即使绕过前两层（如直接 `new TimesheetQuery()` + `$query->setPage(-5)`），setter 内部的严格比较也保证了非法值不会写入对象。这是 Web 端表单（不走 FOSRestBundle ParamFetcher）和 RepositorySearchTrait 的核心安全保障。
 
 > **关键区分：** `orderBy` 的校验**只**在注解层（`requirements` 正则白名单），`prepareQuery()` 不做校验（直接透传非空字符串）。这意味着全量型端点如果没声明 `orderBy` 的 `requirements`，恶意输入会直接传入 DQL。
 
@@ -720,30 +733,187 @@ if ($requiresCustomer || $requiresTeams) {
 
 ---
 
-## 十、关键文件速查表
+## 十、工时按 UTC 时间过滤（modified_after）
+
+### 10.1 完整调用链
+
+`modified_after` 参数允许增量同步场景：只拉取某时间点之后被修改过的工时记录。调用链如下：
+
+```
+① Controller 注解声明参数
+   [TimesheetController.php#L96]
+   #[Rest\QueryParam(
+       name: 'modified_after',
+       requirements: [new Constraints\DateTime(format: 'Y-m-d\TH:i:s')],
+       strict: true, nullable: true
+   )]
+   → 格式必须为 HTML5 datetime-local (YYYY-MM-DDThh:mm:ss)
+   → 不匹配直接 400 BadRequestHttpException
+        │
+        ▼
+② Controller 解析并构造 DateTimeImmutable (强制 UTC 时区)
+   [TimesheetController.php#L231-L234]
+   if (\is_string($modifiedAfter)) {
+       $query->setModifiedAfter(
+           new \DateTimeImmutable($modifiedAfter, new \DateTimeZone('UTC'))
+       );
+   }
+        │
+        ▼
+③ Query 对象存储
+   [TimesheetQuery.php#L39, #L247-L254]
+   private ?\DateTimeInterface $modifiedAfter = null;
+   public function setModifiedAfter(\DateTimeInterface $modifiedAfter): void
+   { $this->modifiedAfter = $modifiedAfter; }
+        │
+        ▼
+④ Repository 注入 DQL 条件
+   [TimesheetRepository.php#L622-L624]
+   if (null !== $query->getModifiedAfter()) {
+       $qb->andWhere($qb->expr()->gte('t.modifiedAt', ':modified_at'))
+          ->setParameter('modified_at', $query->getModifiedAfter());
+   }
+```
+
+### 10.2 时区强制 UTC 的设计意图
+
+注释中明确说明：*"You need to pass in a UTC date-time, as this field is stored in UTC"* — 即 `t.modifiedAt` 字段在数据库中以 UTC 存储。
+
+- 客户端必须传入 UTC 时间字符串（格式 `Y-m-d\TH:i:s`）
+- 服务端通过 `new \DateTimeZone('UTC')` 强制构造 UTC 时区的 `DateTimeImmutable`，避免 PHP 默认时区干扰
+- DQL 中直接用 `gte` 比较（无时区转换），保证数据库层面可以走 modifiedAt 索引
+
+### 10.3 参数的特殊性
+
+- **仅 Timesheet** 端点支持 `modified_after`，其他列表端点（user/project/customer/activity）均无此参数
+- 与 `begin`/`end`（筛选工时起止时间）语义不同：`modified_after` 筛选的是**记录的最后修改时间**，用于增量同步
+- 存储字段 `t.modifiedAt` 由 Doctrine 的 `#[ORM\Column(name: 'modified_at', type: 'datetime')]` + `Timestampable` 自动维护
+
+---
+
+## 十一、三态可见性参数与 VisibilityInterface / VisibilityTrait
+
+### 11.1 三态常量与接口定义
+
+[VisibilityInterface](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/VisibilityInterface.php) 定义了三个互斥的可见性状态：
+
+| 常量 | 值 | 含义 | API 参数值 |
+|------|----|------|-----------|
+| `SHOW_VISIBLE` | 1 | 仅启用（未隐藏）的实体 | `visible=1`（默认） |
+| `SHOW_HIDDEN` | 2 | 仅禁用（已隐藏）的实体 | `visible=2` |
+| `SHOW_BOTH` | 3 | 全部，不分可见性 | `visible=3` |
+
+白名单集合：`ALLOWED_VISIBILITY_STATES = [3, 1, 2]`（`setVisibility()` 用 `in_array(..., true)` 严格检查）。
+
+### 11.2 VisibilityTrait：默认实现
+
+[VisibilityTrait](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/VisibilityTrait.php) 提供接口的默认实现：
+
+```php
+private int $visibility = VisibilityInterface::SHOW_VISIBLE;  // 默认仅可见
+
+public function setVisibility(int $visibility): void
+{
+    if (\in_array($visibility, VisibilityInterface::ALLOWED_VISIBILITY_STATES, true)) {
+        $this->visibility = $visibility;  // 非法值静默忽略（保留原值）
+    }
+}
+
+public function isShowVisible(): bool { return $this->visibility === self::SHOW_VISIBLE; }
+public function isShowHidden():  bool { return $this->visibility === self::SHOW_HIDDEN; }
+public function isShowBoth():    bool { return $this->visibility === self::SHOW_BOTH; }
+```
+
+> **注意 `setShowBoth()` 已被标记 `@deprecated since 2.41`**，统一改用 `setVisibility(self::SHOW_BOTH)。
+
+### 11.3 哪些 Query 使用了 VisibilityTrait
+
+```
+BaseQuery
+  └── UserQuery:              implements VisibilityInterface + use VisibilityTrait
+  └── CustomerQuery:          implements VisibilityInterface + use VisibilityTrait
+        └── ProjectQuery:     (继承 CustomerQuery)
+              └── ActivityQuery: (继承 ProjectQuery)
+                    └── TimesheetQuery: 不实现 VisibilityInterface
+```
+
+**Timesheet 无可见性参数**：工时记录本身没有 `visible`/`enabled` 字段，无法按可见性过滤。其他四个列表端点（user/project/customer/activity）都支持 `visible`。
+
+### 11.4 API 层参数解析模式
+
+所有可见性端点使用完全一致的解析模式：
+
+```php
+// 注解声明 — 所有端点一致
+#[Rest\QueryParam(name: 'visible', requirements: '1|2|3', default: 1, strict: true, nullable: true, ...)]
+
+// Controller 内部解析 — 所有端点一致
+$visible = $paramFetcher->get('visible');
+if (is_numeric($visible)) {
+    $query->setVisibility((int)$visible);
+}
+```
+
+> 即使注解设置了 `default: 1`，代码仍用 `is_numeric()` 判断后再 `setVisibility()`。这是一个有意为之的防御性编程：`nullable: true` 表示参数缺省时 `ParamFetcher::get()` 返回 `null`，此时跳过 `setVisibility()`，使用 Query 对象内 `VisibilityTrait` 的默认值 `SHOW_VISIBLE`（与 `default: 1` 完全一致，互为冗余保障）。
+
+### 11.5 Repository 层的三态映射
+
+各 Repository 将三态转为不同的 DQL 条件，映射方式按实体层级递增：
+
+| 实体 | 三态分支 | DQL 条件 | 代码位置 |
+|------|---------|---------|---------|
+| **User** | SHOW_VISIBLE | `u.enabled = true` | [UserRepository.php#L304-L306](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/UserRepository.php#L304-L306) |
+| | SHOW_HIDDEN | `u.enabled = false` | [L307-L309](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/UserRepository.php#L307-L309) |
+| | SHOW_BOTH | 无条件（整个 if 块跳过） | |
+| **Customer** | SHOW_VISIBLE | `c.visible = true` | [CustomerRepository.php#L201-L202](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/CustomerRepository.php#L201-L202) |
+| | SHOW_HIDDEN | `c.visible = false` | [L203-L204](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/CustomerRepository.php#L203-L204) |
+| | SHOW_BOTH | 无条件 | |
+| **Project** | SHOW_VISIBLE | `p.visible = true AND c.visible = true` | [ProjectRepository.php#L242-L254](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/ProjectRepository.php#L242-L254) |
+| | SHOW_HIDDEN | `p.visible = false AND c.visible = true` | 同上 |
+| | SHOW_BOTH | 无条件 | |
+| **Activity** | SHOW_VISIBLE | `a.visible = true AND (a.project IS NULL OR (p.visible = true AND c.visible = true))` | [ActivityRepository.php#L275-L295](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/ActivityRepository.php#L275-L295) |
+| | SHOW_HIDDEN | `a.visible = false AND (a.project IS NULL OR (p.visible = true AND c.visible = true))` | 同上 |
+| | SHOW_BOTH | 无条件 | |
+
+**层级递增规律**（与 team 过滤类似）：
+- **User/Customer**（顶层实体）：只过滤自身的 `visible`
+- **Project**（有父实体 Customer）：过滤自身 `visible` **且**强制父客户 `c.visible = true`
+- **Activity**（有父实体 Project → Customer）：过滤自身 `visible` **且**若绑定了项目则强制 `p.visible = true AND c.visible = true`（全局活动 `a.project IS NULL` 不受父级限制）
+
+这意味着：**父实体被隐藏时，子实体即使自身 visible=true 也不可见**。这保证了"隐藏客户 → 其所有项目和活动自动不可见"的级联语义。
+
+---
+
+## 十二、关键文件速查表
 
 | 角色 | 文件 |
 |------|------|
 | API 控制器基类 | [BaseApiController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/BaseApiController.php) |
 | 分页参数/排序参数解析 | [BaseApiController::prepareQuery()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/BaseApiController.php#L62-L112) |
-| 查询基类（所有 Query 的父类） | [BaseQuery.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/BaseQuery.php) |
-| 工时查询（默认 orderBy=begin, order=DESC） | [TimesheetQuery.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/TimesheetQuery.php) |
+| 查询基类（setPage/setPageSize 最终防线） | [BaseQuery.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/BaseQuery.php) |
+| 工时查询（modified_after, orderBy=begin, order=DESC） | [TimesheetQuery.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/TimesheetQuery.php) |
+| 用户查询（三态可见性） | [UserQuery.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/UserQuery.php) |
+| 可见性三态常量定义 | [VisibilityInterface.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/VisibilityInterface.php) |
+| 可见性默认实现 Trait | [VisibilityTrait.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Query/VisibilityTrait.php) |
 | 搜索词解析 | [SearchTerm.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Utils/SearchTerm.php) |
 | 搜索条件构造 | [SearchHelper.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Search/SearchHelper.php) |
 | 搜索配置（可搜索字段、meta 字段映射） | [SearchConfiguration.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Search/SearchConfiguration.php) |
-| Pagination 封装（Pagerfanta 子类） | [Pagination.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Utils/Pagination.php) |
+| Pagination 封装（含 ArrayAdapter 全量加载分支） | [Pagination.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Utils/Pagination.php) |
+| ArrayAdapter 使用示例（Web 端 HelpController） | [HelpController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Controller/HelpController.php) |
 | 分页器接口 | [PaginatorInterface.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Paginator/PaginatorInterface.php) |
 | 带 Loader 的分页器 | [LoaderQueryPaginator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Paginator/LoaderQueryPaginator.php) |
 | 简单查询分页器 | [QueryPaginator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Paginator/QueryPaginator.php) |
 | 响应头注入 | [ViewHandler.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/ViewHandler.php) |
 | 分页越界异常处理 | [PagerfantaExceptionSubscriber.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/EventSubscriber/PagerfantaExceptionSubscriber.php) |
 | FOSRestBundle 异常码映射配置 | [fos_rest.yaml](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/config/packages/fos_rest.yaml) |
-| Timesheet teamlead 自动注入 + team 双重过滤 | [TimesheetRepository::getQueryBuilderForQuery()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/TimesheetRepository.php#L525-L676) |
+| Timesheet teamlead 自动注入 + team 双重过滤 + modified_after | [TimesheetRepository::getQueryBuilderForQuery()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/TimesheetRepository.php#L525-L676) |
 | Timesheet 权限过滤（项目+客户 team） | [TimesheetRepository::addPermissionCriteria()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/TimesheetRepository.php#L404-L446) |
-| Project 权限过滤（项目+客户 team） | [ProjectRepository::getPermissionCriteria()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/ProjectRepository.php#L101-L145) |
-| Customer 权限过滤（客户 team） | [CustomerRepository::getPermissionCriteria()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/CustomerRepository.php#L95-L132) |
-| Activity 权限过滤（活动+项目+客户 team） | [ActivityRepository::getPermissionCriteria()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/ActivityRepository.php#L95-L150) |
-| 完整分页端点示例 | [TimesheetController::cgetAction()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/TimesheetController.php#L73-L247) |
-| 全量列表端点示例 | [UserController::cgetAction()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/UserController.php#L55-L100) |
+| Project 权限过滤（项目+客户 team + 级联可见性） | [ProjectRepository.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/ProjectRepository.php#L101-L270) |
+| Customer 权限过滤（客户 team + 可见性） | [CustomerRepository.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/CustomerRepository.php#L95-L215) |
+| Activity 权限过滤（活动+项目+客户 team + 级联可见性） | [ActivityRepository.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/ActivityRepository.php#L95-L310) |
+| User 可见性过滤（enabled 字段） | [UserRepository.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/UserRepository.php#L273-L338) |
+| 完整分页端点示例（page/size/modified_after/order/orderBy） | [TimesheetController::cgetAction()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/TimesheetController.php#L73-L247) |
+| 全量列表端点示例（三态可见性 visible，无分页） | [UserController::cgetAction()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/UserController.php#L55-L100) |
+| 全量列表端点示例（调用了 prepareQuery 但无分页效果） | [ActivityController::cgetAction()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/ActivityController.php#L45-L115) |
 | 完整分页 Repository 示例 | [TimesheetRepository.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/TimesheetRepository.php#L448-L676) |
 | 全量列表 Repository 示例 | [UserRepository.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/UserRepository.php#L273-L393) |
