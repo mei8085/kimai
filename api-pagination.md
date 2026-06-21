@@ -430,6 +430,56 @@ public function __construct(AdapterInterface $adapter, ?BaseQuery $query = null)
 
 ---
 
+
+#### 5.1.0.3 父类默认值与 CurrentPage 覆盖矩阵
+
+Pagerfanta 父类的**构造函数默认值**（由 [PaginationTest::testDefaults()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/tests/Utils/PaginationTest.php#L21-L27) 验证）：
+
+| 属性 | 默认值 | 测试断言 |
+|------|--------|---------|
+| `currentPage` | `1` | `assertEquals(1, $sut->getCurrentPage())` |
+| `maxPerPage` | `10` | `assertEquals(10, $sut->getMaxPerPage())` |
+| `normalizeOutOfRangePages` | `false`（但 Pagination 构造函数会覆盖为 true） | `assertTrue($sut->getNormalizeOutOfRangePages())` |
+
+> **注意**：父类 Pagerfanta 默认 `normalizeOutOfRangePages = false`，但 Pagination 构造函数的第 ② 段在 `$query === null` 或 `!$query->isApiCall()` 时会**强制设为 true**，这是 Kimai 的自定义行为。
+
+**CurrentPage 二次覆盖链**（与 MaxPerPage 平行但更简单）：
+
+```
+父类默认：   currentPage = 1  ← 初始值（Pagerfanta 构造时设置）
+                    │
+                    ▼
+构造函数 ③： setCurrentPage($query->getPage())  ← 仅传入 $query 时
+                    │
+                    ▼
+外部 ④：     $pagination->setCurrentPage(N)  ← 优先级最高
+```
+
+CurrentPage 与 MaxPerPage 覆盖对比表：
+
+| 场景 | MaxPerPage | CurrentPage | normalizeOutOfRangePages |
+|------|-----------|-------------|-------------------------|
+| **父类默认** | 10 | 1 | false |
+| **ArrayAdapter 分支 ①** | 数组长度 | 不变（仍为 1） | 不变 |
+| **Query 覆盖 ③** | $query->getPageSize() | $query->getPage() | 受 isApiCall() 影响 |
+| **外部手动 ④** | 手动设置值 | 手动设置值 | 需手动调用 |
+
+#### 5.1.0.4 非零长度守门与 NotValidMaxPerPageException → 404 路径
+
+ArrayAdapter 分支的 `($size = $adapter->getNbResults()) > 0` 判断不仅仅是"空数组不用设置"，更是**异常守门**：
+
+1. **Pagerfanta 内部校验**：调用 `setMaxPerPage(0)` 或 `setMaxPerPage(-1)` 时，Pagerfanta 会抛出 `Pagerfanta\Exception\NotValidMaxPerPageException`
+2. **Kimai 异常转换**：[PagerfantaExceptionSubscriber](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/EventSubscriber/PagerfantaExceptionSubscriber.php#L33-L41) 监听 `KernelEvents::EXCEPTION`，将 `NotValidMaxPerPageException` 转换为 `NotFoundHttpException`（HTTP 404）
+3. **完整路径**：`setMaxPerPage(0)` → `NotValidMaxPerPageException` → `PagerfantaExceptionSubscriber::onCoreException()` → `NotFoundHttpException` → 404 响应
+
+> 同样被转换为 404 的还有 `OutOfRangeCurrentPageException`（分页越界），这是 REST API 分页越界返回 404 的底层机制。参见§七。
+
+**ArrayAdapter 分支守门的安全意义**：
+- 空数组时 `getNbResults() = 0`，若直接 `setMaxPerPage(0)` 将触发 `NotValidMaxPerPageException`
+- 通过 `> 0` 判断跳过空数组，避免了"空列表页返回 500 异常"的问题
+- 这是一种**防御性编程**：即使调用方传入空数组，也不会因 MaxPerPage=0 导致崩溃
+
+
 ### 5.1.1 ArrayAdapter 全量加载分支的使用场景
 
 #### 5.1.1.1 唯一使用处：HelpController 语言列表
@@ -470,6 +520,103 @@ $table->setPagination($pagination);
 - **防御性默认**：若调用方忘记外部 `setMaxPerPage(9999)`，① 分支的 `setMaxPerPage(数组长度)` 也能保证单页显示（不会意外分页截断）
 - **类型安全**：严格的 `instanceof ArrayAdapter` 确保不会对数据库查询适配器误触发全量加载
 - **性能考量**：ArrayAdapter 仅用于内存数组，**从不用于数据库查询结果**——数据库查询走 `QueryPaginator` 或 `LoaderQueryPaginator` 实现真正的 LIMIT/OFFSET 分页
+
+#### 5.1.1.4 两步式构造的典型场景深入分析
+
+代码库中存在**两种 Pagination 构造模式**：
+- **一步式**：`new Pagination($adapter, $query)` — 标准模式，构造函数内完成全部设置
+- **两步式**：`new Pagination($adapter)` 后再手动 `setMaxPerPage()` / `setCurrentPage()` — 特殊场景
+
+**三步决策树**判断使用哪种模式：
+```
+是否能将 Query 对象直接传入 Pagination 构造函数？
+  ├── 能 → 一步式（10 处标准 Repository 调用）
+  └── 不能 → 两步式
+            ├── 原因 A：分页查询构造特殊，无法走标准 getPaginatorForQuery 流程
+            │     → TagRepository::getTagCount()
+            └── 原因 B：结果封装对象内部延迟组装，需独立控制越界规范化
+                  → TimesheetResult::getPagerfanta()
+```
+
+**场景 A：TagRepository — 特殊 count 查询**
+
+[TagRepository::getTagCount()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/TagRepository.php#L111-L131)：
+
+```php
+// 手动构造 count 查询（与 data 查询 SELECT 不同）
+$qb->resetDQLPart('select')->resetDQLPart('orderBy')
+   ->select($qb->expr()->count('tag'));
+$counter = (int) $qb->getQuery()->getSingleScalarResult();
+
+// 手动构造 QueryPaginator（已预先算好 count）
+$paginator = new QueryPaginator($qb1->getQuery(), $counter);
+
+// 两步式构造 Pagination
+$pager = new Pagination($paginator);              // 第 1 步
+$pager->setMaxPerPage($query->getPageSize());     // 第 2 步 - 手动补
+$pager->setCurrentPage($query->getPage());         // 第 2 步 - 手动补
+```
+
+**为什么不能一步式？**
+- data 查询 SELECT 包含子查询 `amount`（每标签的工时引用数），count 查询必须重写 SELECT
+- 两条查询结构差异大，无法复用标准 `getPaginatorForQuery()` 模式
+- 虽然 `TagQuery` 继承自 `BaseQuery` 理论上可传入，但两步式更清晰地表达"特殊构造"的语义
+
+**场景 B：TimesheetResult — 结果封装对象内部组装**
+
+[TimesheetResult::getPagerfanta()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/Result/TimesheetResult.php#L93-L102)：
+
+```php
+public function getPagerfanta(): Pagination
+{
+    // 懒加载：统计数据在调用时才计算
+    $loader = new LoaderQueryPaginator(
+        new TimesheetLoader($this->entityManager, $this->timesheetQuery),
+        $this->query,
+        $this->getStatistic()->getCount()  // 触发统计懒加载
+    );
+
+    // 两步式构造
+    $paginator = new Pagination($loader);                     // 第 1 步
+    $paginator->setMaxPerPage($this->timesheetQuery->getPageSize());  // 第 2 步
+    $paginator->setCurrentPage($this->timesheetQuery->getPage());     // 第 2 步
+
+    return $paginator;
+}
+```
+
+**为什么不能一步式？**
+- **越界规范化控制**：若传入 `$this->timesheetQuery`，构造函数会检查 `isApiCall()`。TimesheetResult 主要用于 Web 端导出等场景，希望始终启用越界规范化（true），不受 Query 上 apiCall 标志影响
+- **统计懒加载**：`getStatistic()` 是懒加载的，在构造 Pagination 之前才触发统计查询
+- **封装独立性**：TimesheetResult 是独立的结果对象，自行组装分页器保持了封装完整性
+
+> **对比观察**：标准 Repository 路径（[TimesheetRepository::getPagerfantaForQuery()](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/Repository/TimesheetRepository.php#L448-L451)）使用一步式，因为查询构造和分页参数都在同一上下文。
+
+#### 5.1.1.5 测试用例覆盖情况
+
+测试目录中与 Pagination / ArrayAdapter 相关的测试：
+
+| 测试文件 | 覆盖内容 | 关键测试方法 |
+|---------|---------|-------------|
+| [PaginationTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/tests/Utils/PaginationTest.php) | Pagination 构造函数、默认值、Query 覆盖、API 标志 | `testDefaults()` / `testDefaultQuery()` / `testWithParams()` |
+| [PagerfantaExceptionSubscriberTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/tests/EventSubscriber/PagerfantaExceptionSubscriberTest.php) | 异常转 404 订阅者 | `testGetSubscribedEvents()` / `testWithExceptions()` |
+| [PaginationExtensionTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/tests/Twig/PaginationExtensionTest.php) | Twig 分页扩展渲染 | 分页组件 HTML 渲染 |
+| [ViewHandlerTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/tests/API/ViewHandlerTest.php) | API 响应头注入、分页响应格式 | X-Page / X-Total-Count 等头部 |
+| [TimesheetRepositoryTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/tests/Repository/TimesheetRepositoryTest.php) | 端到端分页查询 | Repository 分页集成测试 |
+
+**PaginationTest 三个测试用例的具体覆盖矩阵**：
+
+| 测试方法 | 适配器 | $query | isApiCall | 验证的断言 |
+|---------|-------|--------|-----------|-----------|
+| `testDefaults()` | ArrayAdapter([]) | ❌ null | - | page=1, maxPerPage=10, normalize=true |
+| `testDefaultQuery()` | ArrayAdapter([]) | ✅ TimesheetQuery | false（默认） | page=1, maxPerPage=50, normalize=true |
+| `testWithParams()` | ArrayAdapter([1,2,3,4,5]) | ✅ 设置了 page=3, size=1 | true | page=3, maxPerPage=1, normalize=false |
+
+> **测试的两个边界**：
+> - `testDefaults()` 使用空数组 `ArrayAdapter([])` 验证了 ArrayAdapter 分支的 `> 0` 判断（空数组不触发 setMaxPerPage，保留父类默认 10）
+> - `testWithParams()` 验证了 Query 参数覆盖 ArrayAdapter 设置的优先级关系
+
+
 ### 5.2 ViewHandler 响应头注入
 
 [ViewHandler](file:///d:/fz/0601-2/solo-dogfeeding/code/58-kimai/src/API/ViewHandler.php#L52-L67) 装饰 FOSRestBundle 的基础 ViewHandler，**在序列化前**检测 View 数据是否为 `Pagination` 实例：
