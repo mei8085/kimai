@@ -12,8 +12,14 @@
 | 客户费率实体 | [CustomerRate.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Entity/CustomerRate.php) |
 | 费率结果值对象 | [Rate.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/Rate.php) |
 | 计算结果写回工时 | [RateCalculator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/Calculator/RateCalculator.php) |
+| 费率重置计算器 | [RateResetCalculator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/Calculator/RateResetCalculator.php) |
+| 时长计算器 | [DurationCalculator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/Calculator/DurationCalculator.php) |
+| 可计费计算器 | [BillableCalculator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/Calculator/BillableCalculator.php) |
+| 计算模式工厂 | [RateCalculatorFactory.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/RateCalculator/RateCalculatorFactory.php) |
 | 经典金额计算器 | [ClassicRateCalculator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/RateCalculator/ClassicRateCalculator.php) |
 | 十进制金额计算器 | [DecimalRateCalculator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/RateCalculator/DecimalRateCalculator.php) |
+| Doctrine 触发入口 | [TimesheetSubscriber.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Doctrine/TimesheetSubscriber.php) |
+| 计算器接口 | [CalculatorInterface.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/CalculatorInterface.php) |
 
 ---
 
@@ -64,6 +70,38 @@ if (null !== $rate->getUser() && $timesheet->getUser() === $rate->getUser()) {
 3. **CustomerRate**：用户匹配（或 user=null） 且 客户匹配（或 customer=null）
 
 > 也就是说，一条 `user=null, activity=null` 的 ActivityRate 可以被视为"所有用户、所有活动的全局活动费率兜底"。同理 ProjectRate、CustomerRate。
+
+### 2.4 同分覆盖问题（重要！）
+
+`getBestFittingRate()` 使用 **score 作为数组键** 存储费率：
+
+```php
+$sorted[$score] = $rate;
+```
+
+**同 score 的多条费率，后遍历到的会覆盖先遍历到的**，最终 `end($sorted)` 只返回最后一条。
+
+遍历顺序由 `findMatchingRates()` 的返回顺序决定：
+1. ActivityRate 查询结果 →
+2. ProjectRate 查询结果 →
+3. CustomerRate 查询结果
+
+但同一类型内部（比如 ActivityRate）的返回顺序由数据库决定，是不确定的。
+
+**真正会发生同分的场景**：
+
+以 ActivityRate 为例，查询条件是 `(user = :user OR user IS NULL) AND (activity = :activity OR activity IS NULL)`，可能同时命中：
+
+| 组合 | 示例 | score（指定用户时） | score（其他用户时） |
+|------|------|---------------------|---------------------|
+| 具体活动 + 指定用户 | activity=X, user=Y | 5 + 1 = 6 | 5（不匹配用户就被过滤了） |
+| 具体活动 + 不限用户 | activity=X, user=null | 5 | 5 |
+| 全部活动 + 指定用户 | activity=null, user=Y | 5 + 1 = 6 | 被过滤 |
+| 全部活动 + 不限用户 | activity=null, user=null | 5 | 5 |
+
+可以看到，**score=6 的情况会有多条**（activity=X+user=Y 和 activity=null+user=Y），它们之间是同分覆盖关系。同理 score=5 也可能有多条。
+
+**结论**：当同 score 有多条匹配费率时，最终选中哪条是**不确定的**，取决于数据库返回顺序。这是一个潜在风险点。
 
 ---
 
@@ -159,13 +197,19 @@ internalRate:
 
 ```php
 $factor = 1.00;
+// do not apply once a value was calculated - see https://github.com/kimai/kimai/issues/1988
 if ($record->getFixedRate() === null && $record->getHourlyRate() === null) {
     $factor = $this->getRateFactor($record);
 }
 ```
 
-> 条件是：**工时实体本身既没写 fixedRate 也没写 hourlyRate**。
-> 只要用户在界面上手工指定过任一费率，星期倍率就不再生效。
+**关键点**：
+
+1. 判断条件读的是 **`$record`（工时实体）上的原始值**，而不是前面步骤计算出的 `$fixedRate` / `$hourlyRate` 变量
+2. 必须 `fixedRate === null` **且** `hourlyRate === null`，两个都为空才启用 factor
+3. 只要工时记录上有任何一个费率字段有值（无论是手工填的还是上次计算写回的），倍率就完全失效
+
+这解释了为什么"改了客户费率后，已经落账的工时连倍率也不会重新应用"——因为落账后 hourlyRate 已经有值了。
 
 `getRateFactor()` 根据记录结束时间是星期几，累加所有匹配规则的 factor。若累加结果 ≤ 0 则用 1.00。
 
@@ -188,13 +232,170 @@ return new Rate($totalRate, $totalInternalRate, $factoredHourlyRate, null);
 | 模式 | 类 | 公式 | 适用场景 |
 |------|-----|------|---------|
 | Classic | [ClassicRateCalculator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/RateCalculator/ClassicRateCalculator.php) | `hourlyRate × (seconds / 3600)`，结果保留 4 位小数 | 默认、精确到秒 |
-| Decimal | [DecimalRateCalculator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/RateCalculator/DecimalRateCalculator.php) | 先 `seconds / 3600` 四舍五入到 2 位小数，再乘 hourlyRate，结果再保留 2 位 | 财务要求按"小数点后两位小时"结账 |
+| Decimal | [DecimalRateCalculator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/RateCalculator/DecimalRateCalculator.php) | 先 `seconds / 3600` 四舍五入到 2 位小数（小时），再乘 hourlyRate，结果再保留 2 位小数 | 财务要求按"小数点后两位小时"结账 |
+
+#### 模式切换方式
+
+由系统配置 `invoice.rounding_mode` 决定，在 [RateCalculatorFactory.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/RateCalculator/RateCalculatorFactory.php#L26-L33) 中：
+
+```php
+public function getRateCalculatorMode(): RateCalculatorMode
+{
+    if ($this->configuration->find('invoice.rounding_mode') === 'decimal') {
+        return new DecimalRateCalculator();
+    }
+    return new ClassicRateCalculator();
+}
+```
+
+- 值为 `decimal` → 使用 `DecimalRateCalculator`
+- 其他任何值（包括默认）→ 使用 `ClassicRateCalculator`
 
 ---
 
-## 四、计算结果如何落账到 Timesheet
+## 四、计算器链：什么时候触发、按什么顺序
 
-这由 [RateCalculator](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/Calculator/RateCalculator.php) 完成（优先级 300，在 DurationCalculator 之后执行）：
+### 4.1 触发时机
+
+所有计算都通过 [TimesheetSubscriber](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Doctrine/TimesheetSubscriber.php) 挂在 Doctrine 的 `onFlush` 事件上（priority = 50）：
+
+```php
+public function onFlush(OnFlushEventArgs $args): void
+{
+    // 对所有 scheduled UPDATE 实体：调用 calculateFields，传入 changeset
+    foreach ($uow->getScheduledEntityUpdates() as $entity) {
+        $this->calculateFields($entity, $uow->getEntityChangeSet($entity));
+        $uow->recomputeSingleEntityChangeSet($meta, $entity);
+    }
+    // 对所有 scheduled INSERT 实体：调用 calculateFields，changeset 为空数组
+    foreach ($uow->getScheduledEntityInsertions() as $entity) {
+        $this->calculateFields($entity);
+        $uow->recomputeSingleEntityChangeSet($meta, $entity);
+    }
+}
+```
+
+**区别**：
+- **UPDATE**：携带完整 `$changeset`（字段变更前后的值对）
+- **INSERT**：`$changes = []`（空数组）
+
+### 4.2 计算器优先级
+
+[CalculatorInterface](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/CalculatorInterface.php) 约定：优先级数字越小，越早执行。
+
+实际执行顺序（按 priority 升序）：
+
+| 优先级 | 计算器 | 作用 |
+|--------|--------|------|
+| 50 | RateResetCalculator | 检测 project/activity/user 变更时自动 resetRates() |
+| 100 | BillableCalculator | 根据 billableMode 计算 billable 字段 |
+| 200 | DurationCalculator | 计算 duration（含舍入规则） |
+| 300 | RateCalculator | 调用 RateService 计算费率金额并写回 |
+| 1000（默认） | 第三方/插件计算器 | 默认优先级 |
+
+在 [TimesheetSubscriber::calculateFields()](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Doctrine/TimesheetSubscriber.php#L75-L97) 中按 priority 排序后依次执行。如果两个计算器 priority 相同，会用 `$i++` 错开保证不覆盖。
+
+### 4.3 changeset 的作用
+
+changeset 是 Doctrine UnitOfWork 提供的"字段变更清单"，格式为：`[字段名 => [旧值, 新值]]`。
+
+各计算器对 changeset 的使用方式不同：
+
+**RateResetCalculator（priority 50）** 是最典型的消费者：
+
+```php
+// 如果费率字段本身被手工改动了，什么也不做（尊重手工值）
+foreach (['hourlyRate', 'fixedRate', 'internalRate', 'rate'] as $field) {
+    if (\array_key_exists($field, $changeset)) {
+        return;
+    }
+}
+// 如果 project / activity / user 变了，重置所有费率以触发重新继承
+foreach (['project', 'activity', 'user'] as $field) {
+    if (\array_key_exists($field, $changeset)) {
+        $record->resetRates();
+        break;
+    }
+}
+```
+
+也就是说：
+- 用户手工改了 hourlyRate → 保留，不重置
+- 用户改了所属项目 → 重置所有费率，让 RateCalculator 按新项目重新计算
+
+**RateCalculator（priority 300）** 本身**不读 changeset**，它每次都全量调用 `RateService::calculate()` 重新计算，因为前面 RateResetCalculator 已经决定好了哪些字段需要保留、哪些该清空。
+
+---
+
+## 五、billableMode 对入账的影响
+
+### 5.1 四种模式
+
+在 [Timesheet.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Entity/Timesheet.php#L77-L80) 中定义：
+
+| 常量 | 值 | 含义 |
+|------|-----|------|
+| `BILLABLE_AUTOMATIC` | `auto` | 自动根据活动/项目/客户的 billable 属性推断 |
+| `BILLABLE_YES` | `yes` | 强制可计费 |
+| `BILLABLE_NO` | `no` | 强制不可计费 |
+| `BILLABLE_DEFAULT` | `default` | 默认值（新建时的初始状态） |
+
+### 5.2 计算逻辑
+
+在 [BillableCalculator::calculate()](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/Calculator/BillableCalculator.php#L20-L52) 中：
+
+```php
+switch ($record->getBillableMode()) {
+    case Timesheet::BILLABLE_NO:
+        $record->setBillable(false);
+        break;
+    case Timesheet::BILLABLE_YES:
+        $record->setBillable(true);
+        break;
+    case Timesheet::BILLABLE_AUTOMATIC:
+        $billable = true;
+        // 活动不可计费 → false
+        $activity = $record->getActivity();
+        if ($activity !== null && !$activity->isBillable()) {
+            $billable = false;
+        }
+        // 项目不可计费 → false
+        $project = $record->getProject();
+        if ($billable && $project !== null && !$project->isBillable()) {
+            $billable = false;
+        }
+        // 客户不可计费 → false
+        if ($billable && $project !== null) {
+            $customer = $project->getCustomer();
+            if ($customer !== null && !$customer->isBillable()) {
+                $billable = false;
+            }
+        }
+        $record->setBillable($billable);
+        break;
+}
+```
+
+**自动模式的继承链**（任一为 false 则结果为 false，类似"与"逻辑）：
+
+```
+activity.billable  →  project.billable  →  customer.billable  →  最终 billable
+```
+
+### 5.3 与费率计算的关系
+
+**注意**：`billable` 字段**不影响 `RateService::calculate()` 的计算过程**。也就是说，即使一条工时被标记为不可计费，它的 `rate` 字段仍然会照常算出金额。
+
+`billable` 的作用体现在：
+- 报表统计（收入统计只汇总 billable=true 的记录）
+- 开票（发票只包含 billable 工时）
+- 列表筛选
+
+---
+
+## 六、计算结果如何落账到 Timesheet
+
+这由 [RateCalculator](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/Calculator/RateCalculator.php)（priority 300）完成：
 
 ```php
 public function calculate(Timesheet $record, array $changeset): void
@@ -219,15 +420,15 @@ public function calculate(Timesheet $record, array $changeset): void
 |------|------|------|
 | `rate` | 本条工时的总金额（对外账单金额） | float, not null |
 | `internalRate` | 本条工时的内部成本金额 | float, nullable |
-| `hourlyRate` | 参与计算的小时费率（可能已乘 factor） | float, nullable |
-| `fixedRate` | 参与计算的固定费率 | float, nullable |
+| `hourlyRate` | 参与计算的小时费率（小时费率模式下为已乘 factor 后的值；固定费率模式下不会被覆盖） | float, nullable |
+| `fixedRate` | 参与计算的固定费率（仅固定费率场景有值） | float, nullable |
 
 > 一旦这些值被写入数据库，下一次计算时它们将作为 Step 2 的输入，**优先于一切继承规则**。
 > 这就是为什么"改了全局费率后，历史工时金额不变"——除非调用 `Timesheet::resetRates()` 清空。
 
 ---
 
-## 五、清空费率以触发重新继承
+## 七、清空费率以触发重新继承
 
 [Timesheet::resetRates()](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Entity/Timesheet.php#L589-L596)：
 
@@ -242,11 +443,72 @@ public function resetRates(): void
 }
 ```
 
-清空后下次计算器运行时，Step 2 读出的值全是 null，将完整走一遍费率继承链。
+清空后下次计算器运行时，Step 2 读出的值全是 null，将完整走一遍费率继承链。同时 billableMode 也重置为自动模式。
+
+### 自动触发 resetRates() 的场景
+
+在 [RateResetCalculator](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/Calculator/RateResetCalculator.php) 中，当检测到以下字段变化且用户**没有手工修改费率字段**时，自动重置：
+
+- `project` 变更
+- `activity` 变更
+- `user` 变更
 
 ---
 
-## 六、示例场景
+## 八、findMatchingRates 的查询语义与 NPE 风险
+
+### 8.1 orX + eq + isNull 的组合语义
+
+每个费率查询的 WHERE 条件都是这个模式：
+
+```php
+$qb->expr()->orX(
+    $qb->expr()->eq('r.user', ':user'),
+    $qb->expr()->isNull('r.user')
+)
+```
+
+为什么不能只写 `eq('r.user', ':user')` 然后传 null？
+
+因为在 DQL/SQL 中，`= NULL` 的结果是 **NULL（不是 true 也不是 false）**，不会匹配任何行。必须用 `IS NULL` 才能正确匹配空值。
+
+所以代码用 `orX(eq(...), isNull(...))` 的方式表达：**"要么等于指定用户，要么用户字段为空（全局规则）"**。
+
+同理 activity / project / customer 字段。
+
+### 8.2 project 为 null 的 NPE 风险
+
+在 [findMatchingRates()](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Repository/TimesheetRepository.php#L786-L849) 的 CustomerRate 查询中：
+
+```php
+->setParameter('customer', $timesheet->getProject()->getCustomer())
+```
+
+这里直接链式调用了 `getProject()->getCustomer()`。
+
+虽然 `Timesheet` 实体上 `project` 字段有 `JoinColumn(nullable: false)` 和 `@Assert\NotNull`，但 PHP 属性声明是 `?Project $project = null`，在以下场景 project 可能为 null：
+
+1. 新建的 Timesheet 对象，还没 setProject()
+2. 某些非标准流程绕过了验证
+
+**如果 project 为 null，这里会抛出 `Error: Call to a member function getCustomer() on null`。**
+
+> 实际上，正常业务流程中 project 必填，所以这个 NPE 很少触发。但在单元测试或 API 直接构造实体时可能遇到。
+
+### 8.3 传入 null 参数给 eq() 的行为
+
+如果 `$timesheet->getActivity()` 返回 null，然后 `setParameter('activity', null)`，那么 `eq('r.activity', ':activity')` 生成的 SQL 相当于 `r.activity_id = NULL`，在 WHERE 中永远为 false（NULL = NULL 结果为 UNKNOWN）。
+
+这恰好与 `orX` 配合正确：
+- `eq` 分支永远 false
+- 只剩下 `isNull` 分支生效
+- 也就是只匹配 `activity IS NULL` 的费率记录
+
+所以**即使入参为 null，查询语义仍然是正确的**（只要 orX 中包含 isNull 分支）。这是一个"意外正确"的设计。
+
+---
+
+## 九、示例场景
 
 **场景 A：用户只配了客户费率（不限用户），活动和项目都没配。**
 
@@ -276,15 +538,38 @@ public function resetRates(): void
 
 - Step 2 直接拿到 `$hourlyRate = 200`
 - Step 3 即便查到 ActivityRate 100，因 `??=` 也不会覆盖
-- 星期 factor 不再生效（判断条件：`$record->getHourlyRate() !== null`）
+- 星期 factor 不再生效（判断条件读的是 `$record->getHourlyRate()`，它不是 null）
 - 总金额 = 200 × duration / 3600
+
+**场景 E：用户把某条工时从项目 A 改到项目 B。**
+
+1. onFlush 触发，changeset 中包含 `project` 字段变更
+2. RateResetCalculator（priority 50）检测到 project 变了，且 hourlyRate/fixedRate 没在 changeset 中（不是手工改的）
+3. 调用 `$record->resetRates()`，所有费率字段清空
+4. DurationCalculator（200）重新算时长
+5. RateCalculator（300）调用 RateService，按新项目的费率规则重新计算并写回
+6. 最终工时的金额跟随新项目
 
 ---
 
-## 七、易错点总结
+## 十、易错点总结
 
-1. **"改了客户费率，已录入的工时没变化"** —— 正常，已落账的 hourlyRate/fixedRate 优先级最高。需要 resetRates() 才能重新继承。
-2. **"星期倍率没生效"** —— 检查工时是否已有 hourlyRate 或 fixedRate。只要有，倍率就被禁用。
-3. **"Fixed 费率和 Hourly 费率同时存在怎么办"** —— Fixed 先被判定（Step 4），Hourly 分支不再执行。
-4. **"同一层级（如 ProjectRate）既存在指定用户又存在不限用户"** —— 指定用户的 score +1，会优先命中。
+1. **"改了客户费率，已录入的工时没变化"** —— 正常。已落账的 hourlyRate/fixedRate 优先级最高，不会被新规则覆盖。需要 resetRates() 才能重新继承。
+
+2. **"星期倍率没生效"** —— 检查 `timesheet.hourlyRate` 和 `timesheet.fixedRate` 是否都为 null。只要任一有值，倍率就被禁用。这是读实体上的值判断的，不是读计算过程中的变量。
+
+3. **"Fixed 费率和 Hourly 费率同时存在怎么办"** —— Fixed 先被判定（Step 4），直接 return，Hourly 分支不再执行。
+
+4. **"同一层级既存在指定用户又存在不限用户"** —— 指定用户的 score +1，优先命中。
+
 5. **"内部费率 internalRate 的兜底"** —— 最后回退到 hourlyRate，所以如果只配了对外费率，内部成本默认等于对外费率。
+
+6. **"同分覆盖不确定"** —— getBestFittingRate() 用 score 当数组键，同分时后遍历到的覆盖先遍历到的。比如 activity=X+user=Y 和 activity=null+user=Y 都是 score=6，选哪条取决于数据库返回顺序。
+
+7. **"billable=false 也会计入 rate"** —— 是的，billable 只影响报表和开票，不影响 rate 字段的计算。
+
+8. **"project 为 null 时 findMatchingRates 会崩"** —— CustomerRate 查询中直接 `getProject()->getCustomer()` 链式调用，正常业务不会触发，但测试或边界场景可能 NPE。
+
+9. **"Decimal 模式怎么切"** —— 系统配置 `invoice.rounding_mode` 设为 `decimal` 即启用十进制模式，其他值用默认经典模式。配置入口在 [RateCalculatorFactory.php](file:///d:/fz/0601-2/solo-dogfeeding/code/57-kimai/src/Timesheet/RateCalculator/RateCalculatorFactory.php)。
+
+10. **"计算器执行顺序"** —— 50（重置）→ 100（可计费）→ 200（时长）→ 300（费率）。费率计算放在最后，确保 duration 已经算好（含舍入）。
